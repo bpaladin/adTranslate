@@ -1,6 +1,6 @@
-# PDF Translator
+# PDF Translator v0.9
 
-Параллельный перевод PDF-документов на другой язык с сохранением форматирования и изображений.
+Параллельный перевод PDF-документов на другой язык с сохранением форматирования и изображений. Поддерживает режим перевода и генерации рефератов.
 
 ## Установка
 
@@ -8,75 +8,174 @@
 pip install -r requirements.txt
 ```
 
-## Использование
+Зависимости: `pymupdf`, `openai`, `requests`, `jinja2`, `tqdm`, `markdown`, `httpx`.
+
+## Быстрый старт
 
 ```bash
-python main.py input.pdf output.html -t gemini
+# Перевод через Google (без ключа)
+python main.py paper.pdf paper_ru.html
+
+# Перевод через Gemini
+python main.py paper.pdf paper_ru.html -t gemini --gemini-api-key YOUR_KEY
+
+# Реферат статьи
+python main.py paper.pdf summary.html -t llama --summary
+
+# Локальный переводчик (llama.cpp)
+python main.py paper.pdf paper_ru.html -t llama
 ```
 
-### Позиционные аргументы
+## CLI
 
-| Аргумент | Описание |
-|----------|----------|
-| `input` | Входной PDF файл |
-| `output` | Выходной HTML файл |
+```
+python main.py <input.pdf> <output.html> [опции]
+```
+
+### Обязательные аргументы
+input.pdf		Входной PDF-файл
+output.html		Выходной HTML-файл
 
 ### Опции
 
-| Флаг | По умолчанию | Описание |
-|------|-------------|----------|
-| `-l, --lang` | `ru` | Целевой язык перевода |
-| `-t, --translator` | `openrouter` | Переводчик: `google`, `openrouter`, `llama`, `gemini` |
-| `--api-key` | — | API ключ (или переменная окружения) |
-| `--gemini-model` | `gemini-2.0-flash` | Модель Gemini |
-| `--llama-model` | `gemma4` | Модель llama.cpp |
-| `--llama-url` | `http://localhost:8080/v1` | URL llama.cpp сервера |
-| `--workers` | `auto` | Число параллельных воркеров |
-| `--task-timeout` | `600` | Таймаут на перевод (сек) |
-| `-q, --quiet` | — | Тихий режим |
-| `-v, --verbose` | — | Подробный вывод |
+```
+Опция                           По умолчанию    Значение
+-l, --lang			ru		Целевой язык перевода
+-t, --translator		google		Переводчик: google, gemini, openrouter, llama, groq
+--summary			-		Режим реферата (LLM на англ. -> перевод)
+--summary-translator		= -t		Переводчик для генерации реферата
+--summary-lang-translator	google		Переводчик для перевода реферата
+--api-key			-		API-ключ для OpenRouter
+--gemini-api-key		-		API-ключ для Gemini
+--gemini-model			gemini-flash-latest	Модель Gemini
+--groq-api-key			-		API-ключ для Groq
+--groq-model			auto		Модель Groq
+--llama-model			gemma4		Модель llama.cpp
+--llama-url			http://localhost:8080/v1	URL llama.cpp сервера
+--proxy				http://127.0.0.1:7897	HTTP прокси для сетевых LLM
+--no-proxy			-		Отключить прокси
+--workers			cpu*2		Число параллельных воркеров
+--task-timeout			600		Таймаут на весь перевод (сек)
+-q, --quiet			-		Тихий режим
+-v, --verbose			-		Подробный вывод
+```
 
 ### Переменные окружения
 
-| Переменная | Для кого |
-|------------|----------|
-| `GEMINI_API_KEY` | Gemini |
-| `OPENROUTER_API_KEY` | OpenRouter |
-| `OPENAI_API_KEY` | OpenRouter (fallback) |
+```
+GEMINI_API_KEY			API-ключ для Google Gemini
+OPENROUTER_API_KEY		API-ключ для OpenRouter
+OPENAI_API_KEY			API-ключ OpenAI (fallback для OpenRouter)
+GROQ_API_KEY			API-ключ для Groq
+```
 
-### Примеры
+## Переводчики
+
+```
+Имя             Proxy           Адрес                   Значение
+google		Не нужен	Нет			Google Translate API (бесплатный)
+gemini		Нужен		http://127.0.0.1:7897	Google Gemini через OpenAI-совместимый API
+openrouter	Нужен		http://127.0.0.1:7897	OpenRouter (доступ к множеству моделей)
+llama		Не нужен	Нет			Локальный llama.cpp сервер
+groq		Нужен		Нет			Groq API (бесплатные модели)
+```
+
+- **Прокси:** для gemini и openrouter автоматически включается прокси `http://127.0.0.1:7897` (отключается через `--no-proxy`)
+- **Кэш:** результаты переводов сохраняются в SQLite (`translation_cache.db`) на 30 дней
+
+## Режимы работы
+
+### Translate (по умолчанию)
+
+Полный перевод PDF-документа с сохранением:
+- Форматирования (абзацы, заголовки, списки)
+- Изображений и подписей к ним
+- Таблиц (не переводятся, выводятся в исходном виде)
+- Списка литературы (не переводится)
+
+Параллельный перевод через `ThreadPoolExecutor`. Короткие фразы (≤40 символов) — показывается только перевод. Длинный текст — перевод + свёрнутый блок с оригиналом.
+
+### Summary (реферат)
+
+Генерация структурированного реферата научной статьи:
 
 ```bash
-# Перевод через Gemini
-GEMINI_API_KEY=your_key python main.py paper.pdf paper_ru.html -t gemini
+# Реферат через llama (по умолчанию)
+python main.py paper.pdf summary.html -t llama --summary
 
-# Перевод через Google (без ключа)
-python main.py paper.pdf paper_ru.html -t google
+# Реферат через Groq, перевод через Google
+python main.py paper.pdf summary.html -t groq --summary --summary-lang-translator google
 
-# Перевод на английский
-python main.py paper.pdf paper_en.html -l en -t openrouter --api-key your_key
+# Реферат через Gemini, перевод через llama
+python main.py paper.pdf summary.html -t gemini --summary --summary-lang-translator llama
+```
+
+Формат реферата:
+```
+КРАТКОЕ СОДЕРЖАНИЕ: 4-5 предложений
+КЛЮЧЕВЫЕ НАХОДКИ: список
+СИЛЬНЫЕ СТОРОНЫ: список
+СЛАБЫЕ СТОРОНЫ: список
+```
+
+Режим `--summary` работает в два этапа:
+1. LLM генерирует реферат **на английском** (чанки 6000 символов)
+2. Полученный реферат переводится на целевой язык
+
+## Батч-обработка
+
+```bash
+# Пакетный перевод всех PDF в каталоге
+./batch_translator.sh
+
+# Пакетная генерация рефератов
+./batch_summary.sh [КАТАЛОГ] [РЕЖИМ] [МОДЕЛЬ]
+
+# Примеры
+./batch_summary.sh                                    # summary, gemma4
+./batch_summary.sh ./pdfs summary_translate qwen3.5   # комбинированный режим
+./batch_summary.sh ./pdfs summary smollm              # стандартный режим
 ```
 
 ## Архитектура
 
 ```
-main.py                    — CLI обёртка
+main.py                        — CLI обёртка
 modules/
-  pdf_extractor.py         — Извлечение текста и структуры из PDF
-  block_classifier.py      — Классификация блоков (heading, paragraph, reference, table...)
-  table_processor.py       — Извлечение таблиц
-  image_processor.py       — Извлечение изображений
-  translation_engine.py    — Переводчики (Google, OpenRouter, LlamaCpp, Gemini)
-  pipeline.py              — Оркестрация: извлечение → классификация → перевод → HTML
-  cache_manager.py         — SQLite кэш переводов
-  html_renderer.py         — Генерация HTML-отчёта
+  ├── pipeline.py              — Пайплайн обработки PDF + фабрика переводчиков
+  ├── translation_engine.py    — Все переводчики (Google, Gemini, OpenRouter, LlamaCpp, Groq)
+  ├── pdf_extractor.py         — Извлечение текста из PDF (PyMuPDF)
+  ├── block_classifier.py      — Классификация блоков (heading/paragraph/reference)
+  ├── image_processor.py       — Извлечение изображений
+  ├── table_processor.py       — Обработка таблиц
+  ├── cache_manager.py         — SQLite кэш переводов
+  └── html_renderer.py         — Генерация HTML (Jinja2)
 ```
 
-## Поведение
+### Пайплайн
 
-- **Таблицы** не переводятся, выводятся в исходном виде.
-- **Список литературы** (после заголовка References/Bibliography/Литература) не переводится.
-- **Короткие фразы** (≤40 символов) — показывается только перевод.
-- **Длинный текст** — перевод + свёрнутый блок с оригиналом.
-- Используется SQLite-кэш для повторных запросов.
-- Автоматический fallback: основной переводчик → Google.
+```
+[1/5] Извлечение данных из PDF (текст, таблицы, изображения)
+  ↓
+[2/5] Извлечение изображений и таблиц
+  ↓
+[3/5] Классификация блоков (heading/paragraph/reference/table)
+  ↓
+[4/5] Пост-обработка (объединение ссылок, удаление дубликатов)
+  ↓
+[5/5] Параллельный перевод или Генерация реферата
+  ↓
+     Генерация HTML-отчёта
+```
+
+## Автоопределение модели llama
+
+Если модель не задана или используется `gemma4` по умолчанию, llama.cpp автоматически:
+1. Запрашивает список доступных моделей через `GET /v1/models`
+2. Ищет модель с `gemma` и `4` в названии
+3. Если не найдено — берёт первую доступную
+
+## Логирование
+
+- **Консоль:** `INFO` и выше (`-v` — `DEBUG`, `-q` — `WARNING`)
+- **Файл:** `pdf_translator.log` (все сообщения, `DEBUG`+)

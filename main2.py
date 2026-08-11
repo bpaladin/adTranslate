@@ -1,17 +1,14 @@
 #!/usr/bin/env python3
 """
 PDF Translator — единый скрипт для перевода и реферирования PDF-документов.
-Поддерживает Google Translate, OpenRouter и локальный llama.cpp.
-Объединяет main2.py (ML-классификация, профилирование) и
-pdf_translator_online.py (protect/restore, retry, dark-тема HTML).
+Поддерживает Google Translate и локальный llama.cpp (только как клиент к уже запущенному серверу).
+Автоматически находит работающий сервер через pgrep, фильтрует по модели.
 """
-
 import os
 import sys
 import re
 import time
 import json
-import random
 import atexit
 import signal
 import hashlib
@@ -20,14 +17,12 @@ import threading
 import subprocess
 import argparse
 import warnings
-import html as html_mod
+import html
 import base64
 import contextlib
-from pathlib import Path
 from dataclasses import dataclass, field
-from typing import Optional, List, Dict, Any, Tuple, Match
-from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
+from typing import Optional, List, Dict, Any, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import fitz
 import requests
@@ -36,17 +31,12 @@ from cachetools import LRUCache
 from jinja2 import Template
 from requests.adapters import HTTPAdapter
 
+# ---- Попытка использовать pymupdf_layout ----
 try:
     from pymupdf_layout import extract_layout
     HAVE_LAYOUT = True
 except ImportError:
     HAVE_LAYOUT = False
-
-try:
-    from tqdm import tqdm
-    TQDM = True
-except ImportError:
-    TQDM = False
 
 # ---- Логирование ----
 logging.basicConfig(
@@ -59,6 +49,7 @@ warnings.filterwarnings("ignore")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
+
 # ---- ML классификатор (опционально) ----
 try:
     from sklearn.ensemble import RandomForestClassifier
@@ -67,45 +58,11 @@ try:
 except ImportError:
     HAVE_SKLEARN = False
 
-# =========================================================
-# .env / keys.env загрузка
-# =========================================================
-def _parse_env_file(path: Path):
-    try:
-        if not path.exists():
-            return
-        with open(path, 'r', encoding='utf-8') as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith('#'):
-                    continue
-                if '=' in line:
-                    key, value = line.split('=', 1)
-                    key = key.strip()
-                    value = value.strip().strip('"').strip("'")
-                    if key not in os.environ:
-                        os.environ[key] = value
-    except Exception as e:
-        logger.warning(f"Ошибка загрузки {path.name}: {e}")
-
-
-def load_env_file():
-    script_dir = Path(__file__).parent.absolute()
-    for name in ('keys.env', '.env'):
-        _parse_env_file(script_dir / name)
-
-
-load_env_file()
-
-# ---- API ключи ----
-OPENAI_API_KEY = os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "google/gemma-4-31b-it:free")
-OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://openrouter.ai/api/v1")
-
 
 # ---- Профилирование ----
 @contextlib.contextmanager
 def stage_timer(name: str, timings: Optional[Dict[str, float]] = None):
+    """Контекстный менеджер для замера времени этапов."""
     t0 = time.perf_counter()
     try:
         yield
@@ -116,69 +73,7 @@ def stage_timer(name: str, timings: Optional[Dict[str, float]] = None):
             timings[name] = elapsed
 
 
-# =========================================================
-# РЕГУЛЯРНЫЕ ВЫРАЖЕНИЯ
-# =========================================================
-RE_METADATA = [
-    re.compile(r'^(Journal|Volume|Issue|Pages|DOI|ISSN|ISBN|©|Copyright)'),
-    re.compile(r'^\d+\s*\(?\d{4}\)?'),
-    re.compile(r'^pp?\.\s*\d+'),
-    re.compile(r'^Vol\.\s*\d+'),
-    re.compile(r'^No\.\s*\d+'),
-    re.compile(r'^doi:\s*10\.\d+'),
-]
-RE_JOURNAL = [
-    re.compile(r'Journal\s+of\s+[A-Z]'),
-    re.compile(r'[A-Z][a-z]+\s+Journal'),
-    re.compile(r'Proceedings\s+of\s+the'),
-    re.compile(r'IEEE\s+Transactions'),
-    re.compile(r'Nature|Science|Cell|The\s+Lancet'),
-    re.compile(r'International\s+Journal\s+of'),
-    re.compile(r'European\s+Journal\s+of'),
-    re.compile(r'American\s+Journal\s+of'),
-]
-RE_PROPER_NAMES = [
-    re.compile(r'[А-Я][а-я]+\s+[А-Я]\.[А-Я]\.'),
-    re.compile(r'[А-Я][а-я]+\s+[А-Я][а-я]+\s+[А-Я][а-я]+'),
-    re.compile(r'[A-Z][a-z]+\s+[A-Z]\.\s*[A-Z]\.'),
-    re.compile(r'[A-Z][a-z]+\s+[A-Z][a-z]+\s+[A-Z][a-z]+'),
-    re.compile(r'(?:Prof|Dr|Mr|Mrs|Ms|Miss|PhD|MD)\.\s+[A-Z][a-z]+'),
-]
-RE_REFERENCE_PATTERNS = [
-    re.compile(r'^\s*\[\d+\]'),
-    re.compile(r'^\s*\d+\.\s+[A-ZА-Я]'),
-    re.compile(r'^\s*\(?\d{4}\)?\.?\s+[A-ZА-Я][a-zа-я]+'),
-    re.compile(r'(?:Journal|Conference|Proceedings|IEEE|Springer|Elsevier|Wiley|Oxford|Cambridge)'),
-    re.compile(r'(?:Vol\.|Volume|Issue|No\.|Number|Pages|pp\.|Pg\.)\s*\d+'),
-]
-RE_HEADING = [
-    re.compile(r'^[A-Z][A-Z\s]{3,}$'),
-    re.compile(r'^\d+(?:\.\d+)*\s+[A-ZА-Я]'),
-    re.compile(r'^(?:CHAPTER|SECTION|APPENDIX|ABSTRACT|INTRODUCTION|METHODS|RESULTS|DISCUSSION|CONCLUSION)'),
-]
-RE_TABLE = [
-    re.compile(r'^\s*\+[-+]+\+\s*$'),
-    re.compile(r'^\s*\|.+\|\s*$'),
-    re.compile(r'\d+\s+\d+\s+\d+\s+\d+'),
-]
-RE_URL = re.compile(r'https?://[^\s<>"{}|\\^`\[\]]+|www\.[^\s<>"{}|\\^`\[\]]+', re.IGNORECASE)
-RE_DOI = re.compile(r'10\.\d{4,9}/[-._;()/:A-Z0-9]+', re.IGNORECASE)
-RE_WHITESPACE = re.compile(r'[ \t]+')
-RE_HYPHEN_BREAK = re.compile(r'(\w+)-\s*\n\s*(\w+)')
-
-REF_HEADING_RE = re.compile(
-    r'^(References?|Bibliography|Библиография|Литература|Список\s+литературы|'
-    r'Список\s+использованных\s+источников)\s*$', re.IGNORECASE
-)
-CAPTION_RE = re.compile(r'Figure|Fig\.|Рис\.|Схема|Table|Таблица', re.I)
-LIST_BULLET_RE = re.compile(r'^[\s]*[•\-\*►▸‣⁃◦○●▪]\s', re.MULTILINE)
-LIST_NUM_RE = re.compile(r'^[\s]*(?:\d+[\.\)]\s|[a-z]\.\s|[ivxIVX]+\.\s)', re.MULTILINE)
-LIST_LINE_RE = re.compile(r'^[\s]*([•\-\*►▸‣⁃◦○●▪]|\d+[\.\)]\s|[a-z]\.\s)', re.MULTILINE)
-
-
-# =========================================================
-# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
-# =========================================================
+# ---- Вспомогательные функции ----
 def _format_time(seconds: float) -> str:
     if seconds < 60:
         return f"{seconds:.0f}с"
@@ -192,180 +87,18 @@ def _format_time(seconds: float) -> str:
         return f"{h}ч {m:02d}м"
 
 
-def normalize_text(text: str) -> str:
-    if not text:
-        return ""
-    text = RE_HYPHEN_BREAK.sub(r'\1\2', text)
-    text = RE_WHITESPACE.sub(' ', text)
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-    text = re.sub(r'(?<!\n)\n(?!\n)', ' ', text)
-    text = re.sub(r'\n{3,}', '\n\n', text)
-    return text.strip()
-
-
-def _count_list_lines(text: str) -> int:
-    return len(LIST_LINE_RE.findall(text))
-
-
-def is_metadata(text: str) -> bool:
-    text = text.strip()
-    for pat in RE_METADATA:
-        if pat.search(text):
-            return True
-    for pat in RE_JOURNAL:
-        if pat.search(text):
-            return True
-    if re.search(r'[A-Za-z\s]+,\s+\d+\(\d+\):\s+\d+-\d+', text):
-        return True
-    return False
-
-
-def is_proper_name(text: str) -> bool:
-    for pat in RE_PROPER_NAMES:
-        if pat.search(text):
-            return True
-    return False
-
-
-def is_reference(text: str) -> bool:
-    for pat in RE_REFERENCE_PATTERNS:
-        if pat.search(text):
-            return True
-    if re.search(r'[A-Z][a-z]+,\s+[A-Z]\.?\s+\(?(?:19|20)\d{2}\)?\.', text):
-        return True
-    return False
-
-
-def is_true_table(text: str) -> bool:
-    if len(text) < 50:
-        return False
-    for pat in RE_TABLE:
-        if pat.search(text):
-            return True
-    lines = text.split('\n')
-    if len(lines) >= 3:
-        numbers_per_line = []
-        for line in lines[:5]:
-            numbers = re.findall(r'\b\d+(?:[.,]\d+)?\b', line)
-            if len(numbers) >= 3:
-                numbers_per_line.append(len(numbers))
-        if len(numbers_per_line) >= 2 and all(n >= 3 for n in numbers_per_line):
-            return True
-    return False
-
-
-def is_heading_text(text: str) -> bool:
-    for pat in RE_HEADING:
-        if pat.search(text):
-            return True
-    return False
-
-
-def should_skip_text(text: str, block_type: Optional[str] = None) -> bool:
-    text = text.strip()
-    if not text or len(text) < 2:
-        return True
-    if re.match(r'^\s*\d+\s*$', text) or re.match(r'^\s*Page\s+\d+\s*$', text, re.IGNORECASE):
-        return True
-    if '@' in text or 'http' in text or 'www.' in text:
-        return True
-    if '10.' in text and '/' in text:
-        return True
-    if 'ISBN' in text or 'ISSN' in text:
-        return True
-    if block_type not in ('heading', 'paragraph'):
-        if is_metadata(text):
-            return True
-        if is_reference(text):
-            return True
-    if is_proper_name(text):
-        return True
-    return False
-
-
-def protect_special_elements(text: str) -> Tuple[str, Dict]:
-    placeholders = {}
-    counter = 0
-
-    def url_repl(match: Match) -> str:
-        nonlocal counter
-        placeholder = f"__URL_{counter}__"
-        placeholders[placeholder] = match.group(0)
-        counter += 1
-        return placeholder
-
-    def doi_repl(match: Match) -> str:
-        nonlocal counter
-        placeholder = f"__DOI_{counter}__"
-        placeholders[placeholder] = match.group(0)
-        counter += 1
-        return placeholder
-
-    text = RE_URL.sub(url_repl, text)
-    text = RE_DOI.sub(doi_repl, text)
-    return text, placeholders
-
-
-def restore_protected_elements(text: str, placeholders: Dict) -> str:
-    if not placeholders:
-        return text
-    sorted_ph = sorted(placeholders.items(), key=lambda x: len(x[0]), reverse=True)
-    pattern = re.compile('|'.join(re.escape(k) for k, _ in sorted_ph))
-    return pattern.sub(lambda m: placeholders[m.group(0)], text)
-
-
-def _split_by_sentences(text: str, max_len: int) -> List[str]:
-    chunks = []
-    cur = ""
-    for token in re.split(r'(?<=[.!?;:])\s+(?=[A-ZА-Яa-zа-я\(])', text):
-        if len(token) <= max_len and len(cur) + len(token) + 1 <= max_len:
-            cur += (" " + token) if cur else token
-        else:
-            if cur:
-                chunks.append(cur)
-            if len(token) > max_len:
-                wcur = ""
-                for w in token.split():
-                    if len(w) > max_len:
-                        if wcur:
-                            chunks.append(wcur); wcur = ""
-                        chunks.append(w)
-                    elif wcur and len(wcur) + len(w) + 1 > max_len:
-                        chunks.append(wcur); wcur = w
-                    else:
-                        wcur += (" " + w) if wcur else w
-                cur = wcur
-            else:
-                cur = token
-    if cur:
-        chunks.append(cur)
-    return chunks
-
-
-def split_text_into_chunks(text: str, max_len: int = 4000) -> List[str]:
-    if len(text) <= max_len:
-        return [text]
-    text = text.replace('\r\n', '\n')
-    chunks = []
-    paragraphs = re.split(r'\n{2,}', text)
-    has_paragraphs = len(paragraphs) > 1
-    for para in paragraphs:
-        para = para.strip()
-        if not para:
-            continue
-        if len(para) <= max_len:
-            if chunks and len(chunks[-1]) + len(para) + 2 <= max_len:
-                chunks[-1] += "\n\n" + para
-            else:
-                chunks.append(para)
-        else:
-            chunks.extend(_split_by_sentences(para, max_len))
-    if not has_paragraphs and not chunks:
-        chunks = _split_by_sentences(text, max_len)
-    return chunks if chunks else [text[:max_len]]
+def estimate_processing_time(text_length: int, is_generation: bool = False, translator_type: str = "google") -> float:
+    chars_per_sec = {"google": 800, "llama": 50}
+    if is_generation:
+        rate = chars_per_sec.get(translator_type, 50)
+        return max(5.0, text_length / rate * 4)
+    else:
+        rate = chars_per_sec.get(translator_type, 200)
+        return max(2.0, text_length / rate)
 
 
 def _chunk_text_by_sentences(text: str, max_chunk_size: int = 6000) -> List[str]:
+    """Разбивает текст на чанки по границам предложений."""
     sentences = re.split(r'(?<=[.!?])\s+', text)
     chunks = []
     current = []
@@ -384,16 +117,7 @@ def _chunk_text_by_sentences(text: str, max_chunk_size: int = 6000) -> List[str]
     return chunks if chunks else [text]
 
 
-def _backoff(attempt: int, base: float = 3.0, max_delay: float = 30.0) -> None:
-    if attempt == 0:
-        return
-    delay = min(base * (2 ** (attempt - 1)) + random.uniform(0, 1), max_delay)
-    time.sleep(delay)
-
-
-# =========================================================
-# МОДЕЛИ ДАННЫХ
-# =========================================================
+# ---- Модели данных ----
 @dataclass
 class Span:
     text: str
@@ -436,16 +160,7 @@ class Page:
     height: float = 0.0
 
 
-@dataclass
-class PDFBlock:
-    text: str
-    block_type: str
-    page_num: int
-    font_size: float = 12.0
-    translated_text: Optional[str] = None
-
-
-# ---- Фабрики ----
+# ---- Фабричные методы ----
 def make_span(text: str, font: str = "", size: float = 12, flags: int = 0,
               color: int = 0, origin: tuple = (0, 0), bbox: tuple = (0, 0, 0, 0)) -> Span:
     return Span(text=text, font=font, size=size, flags=flags, color=color, origin=origin, bbox=bbox)
@@ -464,9 +179,7 @@ def make_block(type: str, lines: Optional[List[Line]] = None, bbox: tuple = (0, 
     return b
 
 
-# =========================================================
-# МЕТРИКИ И КЛАССИФИКАЦИЯ
-# =========================================================
+# ---- Утилита метрик блока ----
 @dataclass
 class BlockMetrics:
     text: str
@@ -503,114 +216,7 @@ def block_metrics(block: Block, page_width: float = 0.0) -> BlockMetrics:
     )
 
 
-def _extract_features(block: Block, page_width: float, avg_font_size: float) -> List[float]:
-    m = block_metrics(block, page_width)
-    text = m.text
-    bbox = m.bbox
-    block_height = bbox[3] - bbox[1] if len(bbox) >= 4 else 0
-    block_width = bbox[2] - bbox[0] if len(bbox) >= 4 else 0
-    return [
-        m.max_font,
-        m.max_font / avg_font_size if avg_font_size > 0 else 1.0,
-        float(m.all_upper),
-        float(m.has_bold),
-        float(m.is_centered),
-        m.total_spans,
-        len(text),
-        len(text.split()),
-        text.count('\n') + 1,
-        1.0 if re.match(r'^\d+(\.\d+)*\s+', text) else 0.0,
-        1.0 if re.match(r'^\[\d+\]', text) else 0.0,
-        1.0 if REF_HEADING_RE.match(text) else 0.0,
-        float(_count_list_lines(text)),
-        block_height,
-        block_width,
-    ]
-
-
-class BlockClassifier:
-    LABELS = ["paragraph", "heading", "list", "metadata", "reference", "reference_heading", "empty"]
-
-    def __init__(self):
-        self._ml_model = None
-        self._ml_available = False
-        self._init_ml()
-
-    def _init_ml(self):
-        if not HAVE_SKLEARN:
-            return
-        try:
-            self._ml_model = RandomForestClassifier(
-                n_estimators=50, max_depth=8, random_state=42, n_jobs=-1
-            )
-            self._ml_available = True
-        except Exception:
-            self._ml_available = False
-
-    def train(self, features: List[List[float]], labels: List[str]):
-        if not self._ml_available or not features:
-            return False
-        try:
-            self._ml_model.fit(np.array(features), np.array(labels))
-            return True
-        except Exception:
-            return False
-
-    def _ml_predict(self, features: List[float]) -> Optional[str]:
-        if not self._ml_available or self._ml_model is None:
-            return None
-        try:
-            return self._ml_model.predict(np.array([features]))[0]
-        except Exception:
-            return None
-
-    def classify(self, block: Block, page_width: float, avg_font_size: float) -> str:
-        if not block.lines:
-            return "empty"
-        m = block_metrics(block, page_width)
-        if not m.text or m.total_spans == 0:
-            return "empty"
-
-        if REF_HEADING_RE.match(m.text):
-            return "reference_heading"
-        if re.match(r'^\[\d+\]', m.text):
-            return "reference"
-        if re.search(r'[A-Z][a-z]+\s+[A-Z]\.[A-Z]\.', m.text):
-            return "metadata"
-        if re.search(r'(Journal|Volume|Issue|Pages|DOI|ISSN|ISBN|©|Copyright)', m.text, re.I):
-            return "metadata"
-
-        list_lines = _count_list_lines(m.text)
-        if list_lines >= 2 or (list_lines >= 1 and len(m.text.split('\n')) >= 2):
-            return "list"
-
-        features = _extract_features(block, page_width, avg_font_size)
-        ml_result = self._ml_predict(features)
-        if ml_result and ml_result in self.LABELS:
-            return ml_result
-
-        score = 0
-        if m.max_font > avg_font_size * 1.2:
-            score += 3
-        if m.all_upper:
-            score += 2
-        if m.has_bold:
-            score += 2
-        if m.is_centered:
-            score += 1
-        if len(m.text) < 80:
-            score += 1
-        if re.match(r'^\d+(\.\d+)*\s+', m.text):
-            score += 2
-        return "heading" if score >= 5 else "paragraph"
-
-
-_classifier = BlockClassifier()
-
-
-# =========================================================
-# ИЗВЛЕЧЕНИЕ PDF
-# =========================================================
+# ---- Извлечение PDF ----
 class PDFExtractor:
     def __init__(self, path: str):
         self.doc = fitz.open(path)
@@ -626,7 +232,8 @@ class PDFExtractor:
                     for item in page_data.items:
                         if item['type'] == 'text':
                             block = make_block(type="text", page_num=page_num + 1, bbox=item['bbox'])
-                            for line_text in item['text'].split('\n'):
+                            lines = item['text'].split('\n')
+                            for line_text in lines:
                                 if not line_text.strip():
                                     continue
                                 span = make_span(text=line_text)
@@ -673,6 +280,144 @@ class PDFExtractor:
         return pages
 
 
+# ---- Классификация блоков ----
+REF_HEADING_RE = re.compile(
+    r'^(References?|Bibliography|Библиография|Литература|Список\s+литературы|'
+    r'Список\s+использованных\s+источников)\s*$', re.IGNORECASE
+)
+
+CAPTION_RE = re.compile(r'Figure|Fig\.|Рис\.|Схема|Table|Таблица', re.I)
+
+# Улучшенные regex для списков
+LIST_BULLET_RE = re.compile(r'^[\s]*[•\-\*►▸‣⁃◦○●▪]\s', re.MULTILINE)
+LIST_NUM_RE = re.compile(r'^[\s]*(?:\d+[\.\)]\s|[a-z]\.\s|[ivxIVX]+\.\s)', re.MULTILINE)
+LIST_MIXED_RE = re.compile(r'^[\s]*(?:[•\-\*►▸‣⁃◦○●▪]|\d+[\.\)]\s)', re.MULTILINE)
+LIST_LINE_RE = re.compile(r'^[\s]*([•\-\*►▸‣⁃◦○●▪]|\d+[\.\)]\s|[a-z]\.\s)', re.MULTILINE)
+
+
+def _count_list_lines(text: str) -> int:
+    """Считает количество строк-элементов списка."""
+    return len(LIST_LINE_RE.findall(text))
+
+
+def _extract_features(block: Block, page_width: float, avg_font_size: float) -> List[float]:
+    """Извлекает числовые признаки блока для ML-классификатора."""
+    m = block_metrics(block, page_width)
+    text = m.text
+    bbox = m.bbox
+    block_height = bbox[3] - bbox[1] if len(bbox) >= 4 else 0
+    block_width = bbox[2] - bbox[0] if len(bbox) >= 4 else 0
+    return [
+        m.max_font,
+        m.max_font / avg_font_size if avg_font_size > 0 else 1.0,
+        float(m.all_upper),
+        float(m.has_bold),
+        float(m.is_centered),
+        m.total_spans,
+        len(text),
+        len(text.split()),
+        text.count('\n') + 1,
+        1.0 if re.match(r'^\d+(\.\d+)*\s+', text) else 0.0,
+        1.0 if re.match(r'^\[\d+\]', text) else 0.0,
+        1.0 if REF_HEADING_RE.match(text) else 0.0,
+        float(_count_list_lines(text)),
+        block_height,
+        block_width,
+    ]
+
+
+class BlockClassifier:
+    """Rule-based + опциональный ML-классификатор блоков PDF."""
+
+    LABELS = ["paragraph", "heading", "list", "metadata", "reference", "reference_heading", "empty"]
+
+    def __init__(self):
+        self._ml_model = None
+        self._ml_available = False
+        self._init_ml()
+
+    def _init_ml(self):
+        if not HAVE_SKLEARN:
+            return
+        try:
+            self._ml_model = RandomForestClassifier(
+                n_estimators=50, max_depth=8, random_state=42, n_jobs=-1
+            )
+            self._ml_available = True
+        except Exception:
+            self._ml_available = False
+
+    def train(self, features: List[List[float]], labels: List[str]):
+        """Обучает ML-модель на размеченных данных."""
+        if not self._ml_available or not features:
+            return False
+        try:
+            X = np.array(features)
+            y = np.array(labels)
+            self._ml_model.fit(X, y)
+            return True
+        except Exception:
+            return False
+
+    def _ml_predict(self, features: List[float]) -> Optional[str]:
+        if not self._ml_available or self._ml_model is None:
+            return None
+        try:
+            X = np.array([features])
+            return self._ml_model.predict(X)[0]
+        except Exception:
+            return None
+
+    def classify(self, block: Block, page_width: float, avg_font_size: float) -> str:
+        if not block.lines:
+            return "empty"
+        m = block_metrics(block, page_width)
+        if not m.text or m.total_spans == 0:
+            return "empty"
+
+        # Hard rules — приоритетные
+        if REF_HEADING_RE.match(m.text):
+            return "reference_heading"
+        if re.match(r'^\[\d+\]', m.text):
+            return "reference"
+        if re.search(r'[A-Z][a-z]+\s+[A-Z]\.[A-Z]\.', m.text):
+            return "metadata"
+        if re.search(r'(Journal|Volume|Issue|Pages|DOI|ISSN|ISBN|©|Copyright)', m.text, re.I):
+            return "metadata"
+
+        # Списки — улучшенная детекция
+        list_lines = _count_list_lines(m.text)
+        if list_lines >= 2 or (list_lines >= 1 and len(m.text.split('\n')) >= 2):
+            return "list"
+
+        # ML-классификация (если доступна)
+        features = _extract_features(block, page_width, avg_font_size)
+        ml_result = self._ml_predict(features)
+        if ml_result and ml_result in self.LABELS:
+            return ml_result
+
+        # Rule-based fallback
+        score = 0
+        if m.max_font > avg_font_size * 1.2:
+            score += 3
+        if m.all_upper:
+            score += 2
+        if m.has_bold:
+            score += 2
+        if m.is_centered:
+            score += 1
+        if len(m.text) < 80:
+            score += 1
+        if re.match(r'^\d+(\.\d+)*\s+', m.text):
+            score += 2
+        return "heading" if score >= 5 else "paragraph"
+
+
+# Глобальный экземпляр классификатора
+_classifier = BlockClassifier()
+
+
+# ---- Таблицы и изображения ----
 def extract_tables(page: fitz.Page, page_num: int) -> List[Block]:
     tables = page.find_tables()
     table_blocks = []
@@ -715,6 +460,8 @@ def mark_table_blocks(text_blocks: List[Block], table_blocks: List[Block]):
 
 
 def extract_images(page: fitz.Page, page_num: int, text_blocks: List[Block]) -> Tuple[List[Block], List[Block]]:
+    """Извлекает изображения. Возвращает (figure_blocks, remaining_text_blocks)
+    без мутации исходного списка text_blocks."""
     image_list = page.get_images(full=True)
     figure_blocks = []
     caption_ids = set()
@@ -751,9 +498,7 @@ def extract_images(page: fitz.Page, page_num: int, text_blocks: List[Block]) -> 
     return figure_blocks, remaining
 
 
-# =========================================================
-# RATE LIMITER
-# =========================================================
+# ---- Rate Limiter ----
 class RateLimiter:
     def __init__(self, max_requests_per_second: float = 5.0):
         self.rate = max_requests_per_second
@@ -778,9 +523,7 @@ def _make_session(max_workers: int = 8) -> requests.Session:
     return s
 
 
-# =========================================================
-# ПЕРЕВОДЧИКИ
-# =========================================================
+# ---- Переводчики ----
 class GoogleTranslator:
     def __init__(self, target_lang: str):
         self.name = "Google"
@@ -803,6 +546,15 @@ class GoogleTranslator:
             parts = [p[0] for p in data[0] if p[0]]
             result = " ".join(parts).strip()
             return result if result else None
+        except requests.exceptions.ConnectionError as e:
+            logger.warning(f"   Google Translate: нет соединения — {e}")
+            return None
+        except requests.exceptions.Timeout:
+            logger.warning("   Google Translate: превышено время ожидания")
+            return None
+        except requests.exceptions.HTTPError as e:
+            logger.warning(f"   Google Translate: ошибка HTTP {e.response.status_code} — {e}")
+            return None
         except Exception as e:
             logger.warning(f"   Google Translate: {type(e).__name__}: {e}")
             return None
@@ -811,116 +563,8 @@ class GoogleTranslator:
         return None
 
 
-class OpenRouterRotator:
-    def __init__(self, target_lang: str):
-        self.target_lang = target_lang
-        self.name = "OpenRouter"
-        self._client = None
-        self._models: list = []
-        self._current_idx = 0
-        self._exhausted_models: dict = {}
-        self._model_cooldown_sec = 60
-        self.rate_limiter = RateLimiter(max_requests_per_second=0.3)
-        if OPENAI_API_KEY:
-            try:
-                from openai import OpenAI
-                self._client = OpenAI(
-                    api_key=OPENAI_API_KEY,
-                    base_url=OPENAI_BASE_URL,
-                    default_headers={"X-Title": "pdf-translator"},
-                    timeout=120,
-                    max_retries=0,
-                )
-                self._discover_free_models()
-            except Exception:
-                pass
-
-    def _discover_free_models(self):
-        if not self._client:
-            return
-        try:
-            resp = self._client.models.list()
-            self._models = sorted(
-                [m.id for m in resp.data if "free" in m.id.lower()],
-                key=lambda x: ("openrouter/" in x, x), reverse=True,
-            )
-            if not self._models:
-                self._models = ["openrouter/free", "google/gemma-4-31b-it:free"]
-            logger.info(f"OpenRouter: {len(self._models)} free-моделей")
-        except Exception as e:
-            logger.warning(f"OpenRouter: не удалось получить модели: {e}")
-            self._models = ["openrouter/free", "google/gemma-4-31b-it:free"]
-
-    def _is_available(self, model: str) -> bool:
-        if model not in self._exhausted_models:
-            return True
-        if time.time() - self._exhausted_models[model] > self._model_cooldown_sec:
-            del self._exhausted_models[model]
-            return True
-        return False
-
-    def _next_model(self) -> Optional[str]:
-        for _ in range(len(self._models)):
-            model = self._models[self._current_idx]
-            self._current_idx = (self._current_idx + 1) % len(self._models)
-            if self._is_available(model):
-                return model
-        return None
-
-    def translate(self, text: str) -> Optional[str]:
-        if not self._client:
-            return None
-        attempts = 0
-        while attempts < len(self._models):
-            model = self._next_model()
-            if not model:
-                break
-            self.rate_limiter.acquire()
-            try:
-                resp = self._client.chat.completions.create(
-                    model=model,
-                    messages=[
-                        {"role": "system", "content": f"Translate to {self.target_lang}. Return only translation."},
-                        {"role": "user", "content": text}
-                    ],
-                    temperature=0.3,
-                )
-                content = resp.choices[0].message.content
-                if content:
-                    return content.strip()
-                return None
-            except Exception as e:
-                err_str = str(e).lower()
-                if '429' in err_str or 'rate' in err_str or 'limit' in err_str:
-                    self._exhausted_models[model] = time.time()
-                    time.sleep(5)
-                    attempts += 1
-                    continue
-                attempts += 1
-        return None
-
-    def generate(self, prompt: str) -> Optional[str]:
-        if not self._client:
-            return None
-        model = self._next_model()
-        if not model:
-            model = self._models[0] if self._models else None
-        if not model:
-            return None
-        self.rate_limiter.acquire()
-        try:
-            resp = self._client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.3,
-            )
-            content = resp.choices[0].message.content
-            return content.strip() if content else None
-        except Exception:
-            return None
-
-
 class LlamaCppTranslator:
+    """Клиент для уже запущенного llama.cpp сервера. Находит подходящий сервер через pgrep."""
     def __init__(self, target_lang: str, api_base: str = "http://localhost:8080/v1",
                  expected_model: Optional[str] = None, auto_find: bool = True):
         self.target_lang = target_lang
@@ -931,52 +575,69 @@ class LlamaCppTranslator:
         self._server_ok = False
         self.api_base = None
 
+        # Пробуем указанный URL
         if api_base:
             ok, models = self._check_server(api_base)
             if ok:
                 server_model = models[0] if models else "unknown"
                 if expected_model and server_model != expected_model:
-                    logger.warning(f"   На {api_base} загружена '{server_model}', а нужна '{expected_model}'")
+                    logger.warning(f"   На {api_base} загружена модель '{server_model}', а нужна '{expected_model}'. Пропускаю.")
                 else:
                     self.api_base = api_base.rstrip("/")
                     self._loaded_model = server_model
                     self._server_ok = True
-                    logger.info(f"   llama-server: {self.api_base}, модель: {self._loaded_model}")
+                    logger.info(f"   Подключено к llama-server: {self.api_base}, загружена модель: {self._loaded_model}")
         if not self._server_ok and auto_find:
             servers = self._find_all_servers()
             if not servers:
-                raise RuntimeError("llama-server не найден. Запустите: ./start_llama.sh translate 8080")
+                raise RuntimeError(
+                    "llama-server не найден ни по указанному URL, ни через pgrep.\n"
+                    "Запустите сервер, например: ./start_llama.sh translate 8080"
+                )
             if expected_model is None:
                 self.api_base = servers[0]["url"]
                 self._loaded_model = servers[0]["model"]
                 self._server_ok = True
+                logger.info(f"   Найден сервер: {self.api_base}, модель: {self._loaded_model}")
             else:
                 matched = [s for s in servers if s["model"] == expected_model]
                 if matched:
                     self.api_base = matched[0]["url"]
                     self._loaded_model = matched[0]["model"]
                     self._server_ok = True
+                    logger.info(f"   Найден сервер с моделью '{expected_model}': {self.api_base}")
                 else:
                     available = "\n".join(f"   {s['url']} -> {s['model']}" for s in servers)
-                    raise RuntimeError(f"Модель '{expected_model}' не найдена.\n{available}")
+                    raise RuntimeError(
+                        f"Модель '{expected_model}' не найдена среди запущенных серверов.\n"
+                        f"Доступные серверы:\n{available}\n"
+                        "Запустите сервер с нужной моделью или укажите другую модель."
+                    )
+
         if not self._server_ok:
             raise RuntimeError("Не удалось подключиться ни к одному серверу.")
 
     @staticmethod
     def _find_all_servers() -> List[Dict[str, str]]:
+        """Ищет все запущенные llama-server через pgrep, возвращает список {url, model}."""
         if os.name == 'nt':
             return []
         result = []
         try:
             output = subprocess.check_output(["pgrep", "-a", "llama-server"], text=True, stderr=subprocess.DEVNULL)
             for line in output.splitlines():
+                port = None
                 m = re.search(r'--port\s+(\d+)', line)
-                port = int(m.group(1)) if m else 8080
+                if m:
+                    port = int(m.group(1))
+                else:
+                    port = 8080
                 url = f"http://localhost:{port}/v1"
                 try:
                     resp = requests.get(f"{url}/models", timeout=2)
                     if resp.status_code == 200:
-                        models = [m.get("id", "") for m in resp.json().get("data", [])]
+                        data = resp.json()
+                        models = [m.get("id", "") for m in data.get("data", [])]
                         if models:
                             result.append({"url": url, "model": models[0]})
                 except Exception:
@@ -989,7 +650,8 @@ class LlamaCppTranslator:
         try:
             resp = requests.get(f"{url}/models", timeout=5)
             if resp.status_code == 200:
-                models = [m.get("id", "") for m in resp.json().get("data", [])]
+                data = resp.json()
+                models = [m.get("id", "") for m in data.get("data", [])]
                 if models:
                     return True, models
         except Exception:
@@ -999,17 +661,24 @@ class LlamaCppTranslator:
     def _call_api(self, messages: List[Dict[str, str]], temperature: float = 0.3,
                   max_tokens: int = 4096) -> Optional[str]:
         if not self._server_ok:
+            logger.error("llama-server недоступен")
             return None
         self.rate_limiter.acquire()
         try:
             resp = requests.post(
                 f"{self.api_base}/chat/completions",
-                json={"model": self._loaded_model, "messages": messages,
-                      "temperature": temperature, "max_tokens": max_tokens, "stream": False},
+                json={
+                    "model": self._loaded_model,
+                    "messages": messages,
+                    "temperature": temperature,
+                    "max_tokens": max_tokens,
+                    "stream": False,
+                },
                 timeout=120,
             )
             if resp.status_code == 200:
-                content = resp.json().get("choices", [{}])[0].get("message", {}).get("content")
+                data = resp.json()
+                content = data.get("choices", [{}])[0].get("message", {}).get("content")
                 return content.strip() if content else None
         except Exception:
             pass
@@ -1025,46 +694,7 @@ class LlamaCppTranslator:
         return self._call_api([{"role": "user", "content": prompt}])
 
 
-# ---- Фабрика переводчиков ----
-def create_translator(translator_type: str, target_lang: str,
-                      llama_url: str = "http://localhost:8080/v1",
-                      llama_model: Optional[str] = None,
-                      auto_find: bool = True):
-    if translator_type == "llama":
-        primary = LlamaCppTranslator(target_lang, api_base=llama_url,
-                                     expected_model=llama_model, auto_find=auto_find)
-        fallback = GoogleTranslator(target_lang)
-        return primary, fallback
-    elif translator_type == "openrouter":
-        primary = OpenRouterRotator(target_lang)
-        fallback = GoogleTranslator(target_lang)
-        return primary, fallback
-    elif translator_type == "google":
-        primary = GoogleTranslator(target_lang)
-        fallback = None
-        if OPENAI_API_KEY:
-            try:
-                or_tr = OpenRouterRotator(target_lang)
-                if or_tr._client:
-                    fallback = or_tr
-                    logger.info(f"   Fallback на OpenRouter")
-            except Exception:
-                pass
-        if not fallback:
-            try:
-                fallback = LlamaCppTranslator(target_lang, api_base=llama_url,
-                                              expected_model=llama_model, auto_find=auto_find)
-                logger.info(f"   Fallback на llama: {fallback.api_base}")
-            except Exception:
-                pass
-        return primary, fallback
-    else:
-        raise ValueError(f"Неизвестный переводчик: {translator_type}")
-
-
-# =========================================================
-# КЭШ
-# =========================================================
+# ---- Кэш (LRU в памяти + сохранение на диск) ----
 class TranslationCache:
     _instance = None
     _lock = threading.Lock()
@@ -1132,36 +762,31 @@ class TranslationCache:
             self.save()
 
 
-# =========================================================
-# ПЕРЕВОД С RETRY + FALLBACK
-# =========================================================
-def translate_chunk_with_retry(chunk: str, translator, max_retries: int = 3) -> Optional[str]:
-    if len(chunk) < 3:
-        return chunk
-    for attempt in range(max_retries):
-        _backoff(attempt)
+# ---- Фабрика ----
+def create_translator(translator_type: str, target_lang: str,
+                      llama_url: str = "http://localhost:8080/v1",
+                      llama_model: Optional[str] = None,
+                      auto_find: bool = True):
+    if translator_type == "llama":
+        primary = LlamaCppTranslator(target_lang, api_base=llama_url,
+                                     expected_model=llama_model, auto_find=auto_find)
+        fallback = GoogleTranslator(target_lang)
+        return primary, fallback
+    elif translator_type == "google":
+        primary = GoogleTranslator(target_lang)
+        fallback = None
         try:
-            translated = translator.translate(chunk)
-            if translated and len(translated) >= 2 and translated.strip() != chunk.strip():
-                return translated.strip()
-        except requests.exceptions.HTTPError as e:
-            if attempt == max_retries - 1:
-                logger.warning(f"[{translator.name}] HTTP {e.response.status_code}: {e}")
-        except requests.exceptions.Timeout:
-            if attempt == max_retries - 1:
-                logger.warning(f"[{translator.name}] Таймаут после {max_retries} попыток")
-        except requests.exceptions.ConnectionError as e:
-            if attempt == max_retries - 1:
-                logger.warning(f"[{translator.name}] Ошибка соединения: {e}")
-        except Exception as e:
-            if attempt == max_retries - 1:
-                logger.warning(f"[{translator.name}] Ошибка: {e}")
-    return None
+            fallback = LlamaCppTranslator(target_lang, api_base=llama_url,
+                                          expected_model=llama_model, auto_find=auto_find)
+            logger.info(f"   Fallback на llama: {fallback.api_base}")
+        except Exception:
+            pass
+        return primary, fallback
+    else:
+        raise ValueError(f"Неизвестный переводчик: {translator_type}")
 
 
-# =========================================================
-# PIPELINE ПЕРЕВОДА
-# =========================================================
+# ---- Pipeline перевода ----
 class TranslationPipeline:
     def __init__(self, translator, fallback=None, cache: Optional[TranslationCache] = None,
                  max_workers: int = 8, timeout: int = 600, is_local: bool = False,
@@ -1185,9 +810,10 @@ class TranslationPipeline:
                 self.stats["cached"] += 1
             return cached
         t0 = time.time()
-        result = translate_chunk_with_retry(text, self.translator)
+        result = self.translator.translate(text)
         if not result and self.fallback:
-            result = translate_chunk_with_retry(text, self.fallback)
+            logger.info(f"   Переключение на {self.fallback.name}...")
+            result = self.fallback.translate(text)
         elapsed = time.time() - t0
         with self._stats_lock:
             self._block_times.append(elapsed)
@@ -1200,7 +826,21 @@ class TranslationPipeline:
                 self.stats["failed"] += 1
         return result
 
+    def _get_eta(self, done: int, total: int) -> str:
+        if done == 0 or not self._block_times:
+            return ""
+        elapsed = time.time() - self._start_time
+        avg_per_block = elapsed / done
+        remaining = (total - done) * avg_per_block
+        return f"  ETA: {_format_time(remaining)}"
+
     def translate_blocks(self, blocks: list, lang: str, quiet: bool = False) -> list:
+        try:
+            from tqdm import tqdm
+            TQDM = True
+        except ImportError:
+            TQDM = False
+
         ref_buf = []
         ref_buf_page = 0
         merged_blocks = []
@@ -1208,7 +848,8 @@ class TranslationPipeline:
         def flush_refs():
             if not ref_buf:
                 return
-            merged_text = re.sub(r'\s+', ' ', " ".join(ref_buf)).strip()
+            merged_text = " ".join(ref_buf)
+            merged_text = re.sub(r'\s+', ' ', merged_text).strip()
             ref_block = make_block(type="reference", page_num=ref_buf_page, bbox=(0, 0, 0, 0),
                                    translation=merged_text)
             merged_blocks.append(ref_block)
@@ -1253,25 +894,24 @@ class TranslationPipeline:
 
         def _work(block):
             nonlocal done
-            result = self._translate_one(block.text, lang)
-            block.translation = result if result else block.text
+            text = block.text
+            result = self._translate_one(text, lang)
+            block.translation = result if result else text
             with lock:
                 done += 1
+                elapsed = time.time() - self._start_time
                 if TQDM and not quiet:
-                    elapsed = time.time() - self._start_time
                     avg = elapsed / done
                     remaining = avg * (total - done)
                     pbar.set_postfix_str(f"ост. {_format_time(remaining)}", refresh=True)
                     pbar.update(1)
                 elif not quiet and done % 5 == 0:
-                    elapsed = time.time() - self._start_time
-                    avg = elapsed / done
-                    remaining = avg * (total - done)
-                    logger.info(f"   {done}/{total} ({done*100//total}%) {_format_time(elapsed)} ETA: {_format_time(remaining)}")
+                    eta = self._get_eta(done, total)
+                    logger.info(f"   Переведено {done}/{total} ({done * 100 // total}%)  Прошло: {_format_time(elapsed)}{eta}")
 
         if TQDM and not quiet:
             pbar = tqdm(total=total, desc="🌐 Перевод", unit="блок",
-                        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]")
+                        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]")
 
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             futures = {executor.submit(_work, b): b for b in translatable}
@@ -1295,9 +935,7 @@ class TranslationPipeline:
         return blocks
 
 
-# =========================================================
-# ГЕНЕРАЦИЯ РЕФЕРАТА
-# =========================================================
+# ---- Генерация реферата ----
 def generate_summary(
     pages: list,
     summary_translator_type: str,
@@ -1308,6 +946,11 @@ def generate_summary(
     auto_find: bool = True,
     quiet: bool = False,
 ) -> Dict[str, Any]:
+    try:
+        from tqdm import tqdm
+        TQDM = True
+    except ImportError:
+        TQDM = False
 
     all_text = []
     for page in pages:
@@ -1324,46 +967,61 @@ def generate_summary(
         logger.warning("   Google Translate не поддерживает генерацию. Переключаю на llama.")
         summary_translator_type = "llama"
 
+    # Создание генератора реферата
     summary_translator = None
     try:
         summary_translator, _ = create_translator(
             summary_translator_type, "en",
-            llama_url=llama_url, llama_model=llama_model, auto_find=auto_find,
+            llama_url=llama_url,
+            llama_model=llama_model,
+            auto_find=auto_find,
         )
     except RuntimeError as e:
         logger.error(f"   Не удалось создать генератор ({summary_translator_type}): {e}")
         if summary_translator_type == "llama":
+            logger.warning("   Попытка использовать Google для перевода (генерация невозможна)...")
             summary_translator = GoogleTranslator("en")
         else:
             return {
-                "summary_html": "<p>Ошибка: нет LLM для генерации реферата.</p>",
+                "summary_html": "<p>Ошибка: не удалось подключиться к LLM-серверу для генерации реферата.</p>",
                 "stats": {"chunks": 0, "tokens": 0, "speed": 0, "error": str(e)}
             }
     logger.info(f"   Генератор реферата: {summary_translator.name}")
 
+    # Создание переводчика реферата
     final_translator = None
     if translate_translator_type == "llama":
         try:
-            final_translator, _ = create_translator("llama", lang,
-                llama_url=llama_url, llama_model=llama_model, auto_find=auto_find)
-        except RuntimeError:
+            final_translator, _ = create_translator(
+                "llama", lang,
+                llama_url=llama_url,
+                llama_model=llama_model,
+                auto_find=auto_find,
+            )
+        except RuntimeError as e:
+            logger.warning(f"   Llama-переводчик недоступен: {e}. Используем Google.")
             final_translator = GoogleTranslator(lang)
     else:
         final_translator = GoogleTranslator(lang)
     logger.info(f"   Переводчик реферата: {final_translator.name}")
 
+    # Проверка: может ли генератор реально генерировать
     test_gen = summary_translator.generate("test")
     if test_gen is None:
         logger.warning(f"   {summary_translator.name} не поддерживает generate(). Попытка найти LLM...")
         try:
-            summary_translator, _ = create_translator("llama", "en",
-                llama_url=llama_url, llama_model=llama_model, auto_find=auto_find)
+            summary_translator, _ = create_translator(
+                "llama", "en",
+                llama_url=llama_url,
+                llama_model=llama_model,
+                auto_find=auto_find,
+            )
             logger.info(f"   Генератор реферата: {summary_translator.name}")
         except RuntimeError:
-            logger.error("   Ни один генератор не поддерживает generate().")
+            logger.error("   Ни один генератор не поддерживает generate(). Реферат невозможен.")
             return {
-                "summary_html": "<p>Ошибка: нет LLM-сервера. Запустите llama-server.</p>",
-                "stats": {"chunks": 0, "tokens": 0, "speed": 0, "error": "no LLM"}
+                "summary_html": "<p>Ошибка: нет доступного LLM-сервера для генерации реферата. Запустите llama-server.</p>",
+                "stats": {"chunks": 0, "tokens": 0, "speed": 0, "error": "no LLM available"}
             }
 
     chunks = _chunk_text_by_sentences(full_text, max_chunk_size=6000)
@@ -1396,13 +1054,15 @@ def generate_summary(
                 summary = summary_translator.generate(prompt)
                 if summary:
                     break
+                logger.warning(f"   Чанк {i + 1}/{len(chunks)}: пустой ответ (попытка {attempt + 1})")
             except Exception as e:
-                logger.warning(f"   Чанк {i+1}: ошибка (попытка {attempt+1}): {e}")
+                logger.warning(f"   Чанк {i + 1}/{len(chunks)}: ошибка (попытка {attempt + 1}): {e}")
         if summary:
             cache.put(chunk, cache_key, summary)
             chunk_summaries.append(summary)
             total_tokens += len(summary) // 4
         else:
+            logger.warning(f"   Чанк {i + 1}/{len(chunks)}: используется оригинальный текст")
             chunk_summaries.append(chunk)
             total_tokens += len(chunk) // 4
         if TQDM and not quiet:
@@ -1411,6 +1071,11 @@ def generate_summary(
             remaining = avg * (len(chunks) - i - 1)
             pbar.set_postfix_str(f"ост. {_format_time(remaining)}", refresh=True)
             pbar.update(1)
+        elif not quiet:
+            elapsed = time.time() - start_time
+            avg = elapsed / (i + 1)
+            remaining = avg * (len(chunks) - i - 1)
+            logger.info(f"   Чанк {i + 1}/{len(chunks)} готов  Прошло: {_format_time(elapsed)}  Ост.: {_format_time(remaining)}")
 
     if TQDM and not quiet:
         pbar.close()
@@ -1418,6 +1083,7 @@ def generate_summary(
     if not chunk_summaries:
         return {"summary_html": "<p>Не удалось сгенерировать реферат.</p>", "stats": {"chunks": 0, "tokens": 0, "speed": 0}}
 
+    # Иерархическая суммаризация: если промежуточных чанков больше 5 — группируем по 5
     summaries_to_combine = chunk_summaries
     if len(chunk_summaries) > 5:
         if not quiet:
@@ -1425,9 +1091,12 @@ def generate_summary(
         grouped = []
         for j in range(0, len(chunk_summaries), 5):
             group = chunk_summaries[j:j + 5]
-            group_prompt = "Combine these key points into a concise summary:\n" + "\n---\n".join(group)
+            group_prompt = (
+                "Combine these key points into a concise summary:\n" + "\n---\n".join(group)
+            )
             group_summary = summary_translator.generate(group_prompt)
             if group_summary:
+                cache.put("\n---\n".join(group), cache_key + ":hier", group_summary)
                 grouped.append(group_summary)
                 total_tokens += len(group_summary) // 4
             else:
@@ -1439,17 +1108,24 @@ def generate_summary(
         "strictly in the format:\nBRIEF CONTENT: 4-5 sentences\nKEY FINDINGS: list\nSTRENGTHS: list\nWEAKNESSES: list\n\n"
         "Key points:\n" + "\n---\n".join(summaries_to_combine)
     )
+    if not quiet:
+        logger.info("📝 Генерация итогового реферата...")
     summary_en = None
     for attempt in range(2):
         try:
             summary_en = summary_translator.generate(final_prompt)
             if summary_en:
                 break
+            logger.warning(f"   Итоговый реферат: пустой ответ (попытка {attempt + 1})")
         except Exception as e:
-            logger.warning(f"   Итоговый реферат: ошибка (попытка {attempt+1}): {e}")
+            logger.warning(f"   Итоговый реферат: ошибка (попытка {attempt + 1}): {e}")
     if not summary_en:
+        logger.warning("   Итоговый реферат не сгенерирован, собираем из промежуточных")
         summary_en = "\n\n".join(summaries_to_combine)
 
+    if not quiet:
+        logger.info("📝 Итоговый реферат сгенерирован")
+        logger.info(f"📝 Перевод реферата на {lang}...")
     try:
         final_translated = final_translator.translate(summary_en)
         summary_html = md.markdown(final_translated if final_translated else summary_en)
@@ -1460,126 +1136,15 @@ def generate_summary(
     speed = total_tokens / elapsed if elapsed > 0 else 0
     actual_model = getattr(summary_translator, '_loaded_model', summary_translator.name)
     stats = {"chunks": len(chunks), "tokens": total_tokens, "speed": speed, "model": actual_model, "time": elapsed}
+    if not quiet:
+        if speed > 0:
+            logger.info(f"   Скорость генерации: {speed:.1f} токенов/сек")
+        logger.info(f"   Модель: {actual_model}")
     return {"summary_html": summary_html, "stats": stats}
 
 
-# =========================================================
-# HTML — ТЁМНАЯ ТЕМА (из pdf_translator_online.py)
-# =========================================================
-BLOCK_CSS = """
-<style>
-body { font-family: 'Segoe UI', Arial, sans-serif; margin: 0; padding: 0; background: #0f172a; color: #e2e8f0; }
-.container { max-width: 960px; margin: 0 auto; padding: 24px; }
-h1 { color: #60a5fa; border-bottom: 2px solid #1e3a5f; padding-bottom: 12px; }
-h3 { color: #93c5fd; margin-top: 28px; }
-.page { background: #1e293b; padding: 20px; margin-bottom: 20px; border-radius: 8px; border: 1px solid #334155; }
-.trans-head { border-left: 3px solid #3b82f6; padding-left: 12px; margin: 12px 0; }
-.trans-head h2, .trans-head h3, .trans-head h4 { margin: 4px 0; }
-p { line-height: 1.7; margin: 0 0 10px; text-align: justify; }
-.orig { color: #64748b; font-size: 0.88em; }
-.trans { color: #e2e8f0; }
-.ref-section h2 { color: #60a5fa; border-bottom: 1px solid #334155; padding-bottom: 6px; }
-.ref { color: #64748b; font-size: 0.88em; margin-left: 16px; font-family: 'Courier New', monospace; line-height: 1.4; }
-.meta { color: #64748b; font-size: 0.82em; margin-bottom: 16px; padding-bottom: 8px; border-bottom: 1px solid #334155; }
-.table-wrap { overflow-x: auto; margin: 12px 0; border-radius: 8px; border: 1px solid #334155; }
-.table-wrap table { width: 100%; border-collapse: collapse; font-size: 0.88em; }
-.table-wrap th { background: #0f172a; border: 1px solid #334155; padding: 8px 10px; color: #60a5fa; }
-.table-wrap td { border: 1px solid #334155; padding: 6px 10px; }
-.figure { margin: 20px 0; text-align: center; }
-.figure img { max-width: 100%; height: auto; border-radius: 6px; cursor: zoom-in; }
-.figure-caption { margin-top: 6px; font-style: italic; color: #94a3b8; font-size: 0.85em; }
-.list-block { margin-left: 20px; line-height: 1.6; }
-.summary-container { background: #1e293b; padding: 30px; border-radius: 8px; border: 1px solid #334155; max-width: 900px; margin: 0 auto; }
-.summary-block { background: #172554; padding: 20px; border-radius: 8px; border: 1px solid #1e3a5f; margin-bottom: 20px; }
-.summary-block h2 { margin-top: 0; color: #60a5fa; }
-details.original-block { margin: 4px 0; }
-details.original-block summary { color: #64748b; font-size: 0.85em; cursor: pointer; }
-details.original-block summary:hover { color: #94a3b8; }
-</style>
-"""
-
-
-def _block_to_html_dark(block: Block, in_ref: bool = False) -> str:
-    e = html_mod.escape
-    bt = block.type
-    trans = block.translation or block.text
-    orig = block.text
-
-    if bt == 'reference_heading':
-        return f'<div class="ref-section"><h2>{e(orig)}</h2></div>\n'
-    if in_ref or bt == 'reference':
-        return f"<p class='ref'>{e(orig)}</p>\n"
-    if bt == 'metadata':
-        return f"<div class='meta'>{e(orig)}</div>\n"
-    if bt == 'table' and block.table_data:
-        rows = block.table_data
-        if len(rows) >= 1:
-            out = ['<div class="table-wrap"><table>\n']
-            for idx, row in enumerate(rows[:20]):
-                tag = 'th' if idx == 0 else 'td'
-                if idx == 0:
-                    out.append('<thead><tr>')
-                    out.extend(f'<{tag}>{e(c)}</{tag}>' for c in row)
-                    out.append('</tr></thead><tbody>\n')
-                else:
-                    out.append('<tr>')
-                    out.extend(f'<{tag}>{e(c)}</{tag}>' for c in row)
-                    out.append('</tr>\n')
-            out.append('</tbody></table>\n</div>\n')
-            return ''.join(out)
-    if bt == 'figure':
-        parts = []
-        if block.image_data:
-            parts.append(f'<figure class="figure"><img src="data:image/png;base64,{block.image_data}" />')
-            if block.caption:
-                parts.append(f'<figcaption class="figure-caption">{e(block.caption)}</figcaption>')
-            parts.append('</figure>\n')
-            return ''.join(parts)
-    if bt == 'heading':
-        spans_text = render_spans(block)
-        if orig != trans:
-            return f'<div class="trans-head"><p class="orig">{e(spans_text)}</p><p class="trans">{e(trans)}</p></div>\n'
-        return f"<p class='trans'><b>{e(trans)}</b></p>\n"
-    if bt == 'list':
-        items = orig.split('\n')
-        lis = ''.join(f'<li>{e(item.lstrip("•-*►▸‣⁃◦○●▪ 0123456789.)"))}</li>' for item in items if item.strip())
-        return f'<ul class="list-block">{lis}</ul>\n'
-
-    spans_text = render_spans(block)
-    if orig != trans:
-        return f'<p class="trans">{e(trans)}</p><details class="original-block"><summary>Оригинал</summary><p class="orig">{e(spans_text)}</p></details>\n'
-    return f"<p>{e(trans)}</p>\n"
-
-
-def render_block(block):
-    orig = render_spans(block)
-    trans = block.translation
-    if not trans:
-        return orig
-    SHORT_THRESHOLD = 40
-    if len(orig.strip()) <= SHORT_THRESHOLD:
-        return f'<span class="translation">{html_mod.escape(trans)}</span>'
-    return f'{html_mod.escape(trans)}<details class="original-block"><summary>Оригинал</summary><span class="original">{html_mod.escape(orig)}</span></details>'
-
-
-def render_spans(block):
-    parts = []
-    for line in block.lines:
-        for span in line.spans:
-            text = span.text
-            if span.flags & 2**0:
-                text = f"<b>{text}</b>"
-            if span.flags & 2**1:
-                text = f"<i>{text}</i>"
-            parts.append(text)
-        parts.append("\n")
-    return " ".join(parts)
-
-
-# =========================================================
-# ГЕНЕРАЦИЯ HTML
-# =========================================================
-HTML_TEMPLATE_LIGHT = """
+# ---- Рендеринг HTML ----
+HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html>
 <head>
@@ -1602,6 +1167,7 @@ HTML_TEMPLATE_LIGHT = """
         .original { color: #999; font-size: 0.9em; }
         details.original-block { margin: 4px 0; }
         details.original-block summary { color: #888; font-size: 0.85em; cursor: pointer; }
+        details.original-block summary:hover { color: #555; }
     </style>
 </head>
 <body>
@@ -1638,39 +1204,38 @@ HTML_TEMPLATE_LIGHT = """
 </body>
 </html>
 """
+SHORT_THRESHOLD = 40
 
 
-def generate_html(pages: List[Page], title: str, output_path: str, dark: bool = True):
-    if dark:
-        _generate_html_dark(pages, title, output_path)
-    else:
-        template = Template(HTML_TEMPLATE_LIGHT)
-        rendered = template.render(pages=pages, title=title, render_block=render_block)
-        with open(output_path, 'w', encoding='utf-8') as f:
-            f.write(rendered)
+def render_block(block):
+    orig = render_spans(block)
+    trans = block.translation
+    if not trans:
+        return orig
+    if len(orig.strip()) <= SHORT_THRESHOLD:
+        return f'<span class="translation">{html.escape(trans)}</span>'
+    return f'{html.escape(trans)}<details class="original-block"><summary>Оригинал</summary><span class="original">{html.escape(orig)}</span></details>'
 
 
-def _generate_html_dark(pages: List[Page], title: str, output_path: str):
-    e = html_mod.escape
-    parts = [
-        '<!DOCTYPE html>\n<html><head><meta charset="UTF-8">',
-        f'<title>{e(title)}</title>\n',
-        BLOCK_CSS,
-        '</head>\n<body>\n<div class="container">\n',
-        f'<h1>{e(title)}</h1>\n',
-    ]
-    in_ref = False
-    for page in pages:
-        parts.append(f'<div class="page"><h3>📄 Страница {page.num}</h3>\n')
-        for block in page.blocks:
-            if block.type == 'reference_heading':
-                in_ref = True
-            parts.append(_block_to_html_dark(block, in_ref))
-        parts.append('</div>\n')
-    parts.append('</div></body></html>')
+def render_spans(block):
+    parts = []
+    for line in block.lines:
+        for span in line.spans:
+            text = span.text
+            if span.flags & 2**0:
+                text = f"<b>{text}</b>"
+            if span.flags & 2**1:
+                text = f"<i>{text}</i>"
+            parts.append(text)
+        parts.append("\n")
+    return " ".join(parts)
+
+
+def generate_html(pages: List[Page], title: str, output_path: str):
+    template = Template(HTML_TEMPLATE)
+    rendered = template.render(pages=pages, title=title, render_block=render_block)
     with open(output_path, 'w', encoding='utf-8') as f:
-        f.write(''.join(parts))
-
+        f.write(rendered)
 
 SUMMARY_TEMPLATE = """
 <!DOCTYPE html>
@@ -1712,9 +1277,7 @@ def generate_summary_html(pages: List[Page], summary_html: str, title: str, outp
         f.write(rendered)
 
 
-# =========================================================
-# ОСНОВНОЙ ПРОЦЕСС
-# =========================================================
+# ---- Основной процесс ----
 def process_pdf(
     pdf_path: str,
     output_html: str,
@@ -1729,8 +1292,8 @@ def process_pdf(
     summary_mode: bool = False,
     summary_translator_type: str = "llama",
     translate_translator_type: str = "google",
-    dark_html: bool = True,
 ) -> Dict[str, Any]:
+    import fitz
 
     timings: Dict[str, float] = {}
     total_images = 0
@@ -1739,22 +1302,27 @@ def process_pdf(
     with stage_timer("1. Извлечение PDF", timings):
         extractor = PDFExtractor(pdf_path)
         pages = extractor.extract()
+
         doc = fitz.open(pdf_path)
+
         for page in pages:
             text_blocks = [b for b in page.blocks if b.type == "text"]
             fitz_page = doc[page.num - 1]
+
             try:
                 figure_blocks, text_blocks = extract_images(fitz_page, page.num, text_blocks)
                 page.blocks = [b for b in page.blocks if b.type != "text"] + text_blocks + figure_blocks
                 total_images += len(figure_blocks)
             except Exception as e:
                 logger.warning(f"Ошибка извлечения изображений: {e}")
+
             try:
                 table_blocks = extract_tables(fitz_page, page.num)
                 page.blocks.extend(table_blocks)
                 total_tables += len(table_blocks)
             except Exception as e:
                 logger.warning(f"Ошибка извлечения таблиц: {e}")
+
         doc.close()
     logger.info(f"   Извлечено {len(pages)} стр., {total_images} изобр., {total_tables} табл.")
 
@@ -1780,6 +1348,7 @@ def process_pdf(
                     continue
                 if in_refs and block.type not in ("figure", "table"):
                     block.type = "reference"
+
         for page in pages:
             table_blocks_page = [b for b in page.blocks if b.type == "table"]
             if table_blocks_page:
@@ -1793,9 +1362,14 @@ def process_pdf(
                 logger.warning("   Google Translate не поддерживает генерацию. Переключаю на llama.")
                 summary_translator_type = "llama"
             result = generate_summary(
-                pages, summary_translator_type=summary_translator_type,
-                translate_translator_type=translate_translator_type, lang=lang,
-                llama_url=llama_url, llama_model=llama_model, auto_find=auto_find, quiet=quiet,
+                pages,
+                summary_translator_type=summary_translator_type,
+                translate_translator_type=translate_translator_type,
+                lang=lang,
+                llama_url=llama_url,
+                llama_model=llama_model,
+                auto_find=auto_find,
+                quiet=quiet,
             )
             summary_html = result["summary_html"]
             gen_stats = result["stats"]
@@ -1816,14 +1390,17 @@ def process_pdf(
         return {"stats": stats, "pages": len(pages), "images": total_images, "tables": total_tables, "summary": True}
 
     with stage_timer("4. Перевод", timings):
-        logger.info(f"🌐 Перевод на {lang} ({translator_type})...")
+        logger.info(f"🌐[5/5] Перевод на {lang} ({translator_type})...")
         try:
             translator, fallback = create_translator(
-                translator_type, lang, llama_url=llama_url,
-                llama_model=llama_model, auto_find=auto_find,
+                translator_type, lang,
+                llama_url=llama_url,
+                llama_model=llama_model,
+                auto_find=auto_find,
             )
         except RuntimeError as e:
-            logger.error(f"   Ошибка: {e}. Fallback на Google Translate...")
+            logger.error(f"   Ошибка создания переводчика: {e}")
+            logger.info("   Fallback на Google Translate...")
             translator = GoogleTranslator(lang)
             fallback = None
 
@@ -1831,65 +1408,65 @@ def process_pdf(
         if fallback:
             logger.info(f"   Fallback: {fallback.name}")
 
+        # Динамическое число воркеров для локального сервера
         effective_workers = max_workers
         if translator_type == "llama":
             effective_workers = min(max_workers, 3)
             if not quiet:
                 logger.info(f"   Локальный сервер: ограничено до {effective_workers} воркеров")
 
+        is_local = translator_type == "llama"
         pipeline = TranslationPipeline(
-            translator=translator, fallback=fallback,
-            max_workers=effective_workers, timeout=timeout,
-            is_local=(translator_type == "llama"), translator_type=translator_type,
+            translator=translator,
+            fallback=fallback,
+            max_workers=effective_workers,
+            timeout=timeout,
+            is_local=is_local,
+            translator_type=translator_type,
         )
 
         all_blocks = []
         for page in pages:
             all_blocks.extend(page.blocks)
+
         pipeline.translate_blocks(all_blocks, lang, quiet=quiet)
 
     with stage_timer("5. HTML", timings):
-        generate_html(pages, f"Перевод: {os.path.basename(pdf_path)}", output_html, dark=dark_html)
+        generate_html(pages, f"Перевод: {os.path.basename(pdf_path)}", output_html)
         logger.info(f"   HTML сохранён: {output_html}")
 
     return {
         "stats": {**pipeline.stats, "timings": timings},
-        "pages": len(pages), "images": total_images, "tables": total_tables,
+        "pages": len(pages),
+        "images": total_images,
+        "tables": total_tables,
     }
 
 
-# =========================================================
-# CLI
-# =========================================================
+# ---- CLI ----
 def main():
     parser = argparse.ArgumentParser(description="PDF Translator — единый скрипт")
     parser.add_argument("input", help="Входной PDF файл")
     parser.add_argument("-l", "--lang", default="ru", help="Целевой язык (по умолчанию: ru)")
     parser.add_argument("-t", "--translator", default="google",
-                        choices=["google", "llama", "openrouter"],
-                        help="Переводчик (по умолчанию: google)")
+                        choices=["google", "llama"], help="Переводчик (по умолчанию: google)")
     parser.add_argument("--llama-url", default="http://localhost:8080/v1", help="URL llama.cpp сервера")
-    parser.add_argument("--llama-model", help="Ожидаемое имя модели")
-    parser.add_argument("--no-auto-find", action="store_true", help="Отключить автоматический поиск сервера")
+    parser.add_argument("--llama-model", help="Ожидаемое имя модели (точное совпадение)")
+    parser.add_argument("--no-auto-find", action="store_true", help="Отключить автоматический поиск сервера через pgrep")
     parser.add_argument("--summary", action="store_true", help="Режим реферата")
-    parser.add_argument("--summary-translator", choices=["google", "llama", "openrouter"], default="llama",
+    parser.add_argument("--summary-translator", choices=["google", "llama"], default="llama",
                         help="Генератор реферата (по умолчанию: llama)")
-    parser.add_argument("--summary-lang-translator", choices=["google", "llama", "openrouter"], default="google",
+    parser.add_argument("--summary-lang-translator", choices=["google", "llama"], default="google",
                         help="Переводчик реферата (по умолчанию: google)")
     parser.add_argument("--workers", type=int, default=min(8, (os.cpu_count() or 1) * 2),
                         help="Число воркеров")
     parser.add_argument("--task-timeout", type=int, default=600, help="Таймаут перевода (сек)")
-    parser.add_argument("--dark-html", action="store_true", default=True,
-                        help="Тёмная тема HTML (по умолчанию: вкл)")
-    parser.add_argument("--light-html", action="store_true", help="Светлая тема HTML")
     parser.add_argument("-q", "--quiet", action="store_true", help="Тихий режим")
     parser.add_argument("-v", "--verbose", action="store_true", help="Подробный вывод")
     args = parser.parse_args()
 
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
-
-    dark_html = not args.light_html
 
     input_base = os.path.splitext(args.input)[0]
     output_html = f"{input_base}_summary.html" if args.summary else f"{input_base}_translate.html"
@@ -1913,7 +1490,6 @@ def main():
             summary_mode=args.summary,
             summary_translator_type=args.summary_translator,
             translate_translator_type=args.summary_lang_translator,
-            dark_html=dark_html,
         )
 
         stats = result["stats"]

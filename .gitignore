@@ -66,3 +66,4 @@ __pypackages__/
 #*.ipynb
 analyzer_session.json
 *.db
+*.pdf
