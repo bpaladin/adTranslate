@@ -1,1 +1,0 @@
-/home/ad/Yandex.Disk/Python/HTMLReportBuilder.py

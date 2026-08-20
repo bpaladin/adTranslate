@@ -47,6 +47,8 @@ try:
 except ImportError:
     TQDM = False
 
+__version__ = "1.0.0"
+
 # ---- Логирование ----
 logging.basicConfig(
     level=logging.INFO,
@@ -1950,6 +1952,8 @@ body { font-family: 'Segoe UI', Arial, sans-serif; margin: 0; padding: 0; backgr
 h1 { color: #60a5fa; border-bottom: 2px solid #1e3a5f; padding-bottom: 12px; }
 h3 { color: #93c5fd; margin-top: 28px; }
 .page { background: #1e293b; padding: 20px; margin-bottom: 20px; border-radius: 8px; border: 1px solid #334155; }
+.page > summary { cursor: pointer; font-size: 1.05em; font-weight: bold; color: #93c5fd; padding: 4px 0 8px; user-select: none; }
+.page > summary:hover { color: #60a5fa; }
 .trans-head { border-left: 3px solid #3b82f6; padding-left: 12px; margin: 12px 0; }
 .trans-head h2, .trans-head h3, .trans-head h4 { margin: 4px 0; }
 p { line-height: 1.7; margin: 0 0 10px; text-align: justify; }
@@ -1992,6 +1996,8 @@ body { font-family: Arial, sans-serif; margin: 40px; background: #f0f2f5; }
 h1 { color: #1f2937; border-bottom: 2px solid #d1d5db; padding-bottom: 12px; }
 h3 { color: #374151; margin-top: 28px; }
 .page { background: white; padding: 20px; margin-bottom: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+.page > summary { cursor: pointer; font-size: 1.05em; font-weight: bold; color: #1f2937; padding: 4px 0 8px; user-select: none; }
+.page > summary:hover { color: #2563eb; }
 .trans-head { border-left: 3px solid #3b82f6; padding-left: 12px; margin: 12px 0; }
 p { line-height: 1.7; margin: 0 0 10px; text-align: justify; color: #111827; }
 .orig { color: #9ca3af; font-size: 0.88em; }
@@ -2164,12 +2170,12 @@ HTML_TEMPLATE = """
         <button class="btn-orig" onclick="toggleAllOriginals(false)">Скрыть оригиналы</button>
     </div>
     {% for page in pages %}
-    <div class="page">
-        <h3>📄 Страница {{ page.num }}</h3>
+    <details class="page" open>
+        <summary>📄 Страница {{ page.num }}</summary>
         {% for block in page.blocks %}
             {{ _block_html(block, False) | safe }}
         {% endfor %}
-    </div>
+    </details>
     {% endfor %}
 </div>
 <div id="lightbox" onclick="closeLightbox()"></div>
@@ -2230,6 +2236,8 @@ body { font-family: Arial, sans-serif; margin: 40px; background: #f0f2f5; }
 .summary-block h2 { margin-top: 0; color: #004085; }
 .metadata { background: #f8f9fa; padding: 20px; border-radius: 8px; margin-bottom: 2em; border: 1px solid #dee2e6; }
 .metadata h1 { margin-top: 0; color: #111; font-size: 2em; }
+.page > summary { cursor: pointer; font-size: 1.05em; font-weight: bold; color: #1f2937; padding: 4px 0 8px; user-select: none; }
+.page > summary:hover { color: #2563eb; }
 </style>
 </head>
 <body>
@@ -2238,7 +2246,7 @@ body { font-family: Arial, sans-serif; margin: 40px; background: #f0f2f5; }
 <div class="summary-block">{{ summary_html | safe }}</div>
 <details><summary>Показать исходные тексты</summary>
 {% for page in pages %}
-<div class="page"><h3>Страница {{ page.num }}</h3>
+<details class="page" open><summary>Страница {{ page.num }}</summary>
 {% for block in page.blocks %}
     {% if block.type in ('paragraph', 'heading', 'metadata', 'text', 'list') %}
         {% set orig = render_spans(block) %}
@@ -2246,7 +2254,7 @@ body { font-family: Arial, sans-serif; margin: 40px; background: #f0f2f5; }
         <details><summary>Оригинал (стр. {{ page.num }})</summary><span class="original">{{ orig }}</span></details>
         {% endif %}
     {% endif %}
-{% endfor %}</div>
+{% endfor %}</details>
 {% endfor %}</details></div></body></html>
 """
 
@@ -2450,6 +2458,7 @@ def process_pdf(
 # =========================================================
 def main():
     parser = argparse.ArgumentParser(description="PDF Translator — единый скрипт")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("input", help="Входной PDF файл")
     parser.add_argument("-l", "--lang", default="ru", help="Целевой язык (по умолчанию: ru)")
     parser.add_argument("-t", "--translator", default="google",
@@ -2484,7 +2493,7 @@ def main():
     output_html = f"{input_base}_summary.html" if args.summary else f"{input_base}_translate.html"
 
     logger.info("=" * 60)
-    logger.info(f"PDF TRANSLATOR — {args.translator.upper()}")
+    logger.info(f"PDF TRANSLATOR — {args.translator.upper()} v{__version__}")
     logger.info("=" * 60)
 
     try:
