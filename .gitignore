@@ -67,3 +67,4 @@ __pypackages__/
 analyzer_session.json
 *.db
 *.pdf
+*.7z
