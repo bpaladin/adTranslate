@@ -68,3 +68,7 @@ analyzer_session.json
 *.db
 *.pdf
 *.7z
+*.json
+*.db
+translation_cache.*
+start_llama.sh
