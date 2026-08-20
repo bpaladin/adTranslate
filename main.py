@@ -147,7 +147,17 @@ _REF_LABEL_RE = re.compile(
     r'Equation|Eq\.?|Ref\.?|Page|pp\.?|Appendix|Supplementary|Suppl\.?)\s*$'
 )
 TABLE_CAPTION_RE = re.compile(r'^\s*(?:Table|Таблица|Табл\.?)\s+\d+', re.I)
+TABLE_CAPTION_STRICT_RE = re.compile(
+    r'^\s*(?:Table|Таблица|Табл\.?)\s+\d+\s*[|:.–—-]', re.I)
 CAPTION_RE = re.compile(r'Figure|Fig\.|Рис\.|Схема|Table|Таблица', re.I)
+FIGURE_CAPTION_RE = re.compile(
+    r'^\s*(?:Fig(?:ure)?\.?\s*\d+|Рис\.?\s*\d+|Схема\s*\d+)', re.I
+)
+FIGURE_CAPTION_STRICT_RE = re.compile(
+    r'^\s*(?:Fig(?:ure)?\.?\s*\d+|Рис\.?\s*\d+|Схема\s*\d+)\s*[|:.,–—-]', re.I
+)
+# Максимальная дистанция между фигурой/рисунком и её подписью
+CAPTION_DIST_THRESHOLD = 120.0
 LIST_LINE_RE = re.compile(r'^[\s]*([•\-\*►▸‣⁃◦○●▪]|\d+[\.\)]\s|[a-z]\.\s)', re.MULTILINE)
 
 
@@ -340,7 +350,7 @@ class BlockClassifier:
 
         if REF_HEADING_RE.match(m.text):
             return "reference_heading"
-        if TABLE_CAPTION_RE.match(m.text):
+        if _is_table_caption(m.text):
             return "table"
         if word_count <= self.METADATA_WORD_LIMIT:
             if re.match(r'^\[\d+\]', m.text):
@@ -470,6 +480,127 @@ def extract_tables(page: fitz.Page, page_num: int) -> List[Block]:
     return table_blocks
 
 
+def _row_columns(block: Block, tol: float = 8.0) -> Optional[List[float]]:
+    """Колонки строки таблицы по x0 строк/спанов (ячейки = отдельные строки/спаны)."""
+    if not block.lines:
+        return None
+    if len(block.lines) == 1:
+        xs = [s.bbox[0] for s in block.lines[0].spans if s.text.strip()]
+        if len(xs) < 3:
+            return None
+        gaps = [b - a for a, b in zip(sorted(xs), sorted(xs)[1:])]
+        if gaps and min(gaps) < 5:
+            return None
+    else:
+        xs = [ln.bbox[0] for ln in block.lines if ln.spans]
+        if len(xs) < 3:
+            return None
+    clusters = []
+    for x in sorted(xs):
+        if clusters and x - clusters[-1][-1] <= tol:
+            clusters[-1].append(x)
+        else:
+            clusters.append([x])
+    if len(clusters) < 3:
+        return None
+    return [sum(c) / len(c) for c in clusters]
+
+
+def _columns_align(ref: List[float], cols: List[float],
+                   tol: float = 10.0, min_frac: float = 0.5) -> bool:
+    if not ref or not cols:
+        return False
+    matched = 0
+    for x in cols:
+        if any(abs(x - y) <= tol for y in ref):
+            matched += 1
+    return matched / len(cols) >= min_frac
+
+
+def _build_table_row(block: Block, columns: List[float]) -> List[str]:
+    cells = [""] * len(columns)
+
+    def _cell_text(u) -> str:
+        if isinstance(u, Span):
+            return u.text.strip()
+        return " ".join(s.text for s in u.spans if s.text.strip()).strip()
+
+    def _cell_x(u) -> float:
+        if isinstance(u, Span):
+            return u.bbox[0]
+        return u.bbox[0] if u.spans else 0.0
+
+    units = block.lines[0].spans if len(block.lines) == 1 else block.lines
+    for u in units:
+        text = _cell_text(u)
+        if not text:
+            continue
+        k = min(range(len(columns)), key=lambda kk: abs(_cell_x(u) - columns[kk]))
+        if cells[k]:
+            cells[k] += " " + text
+        else:
+            cells[k] = text
+    return cells
+
+
+def _merge_span_table(caption: Block, row_blocks: List[Block]) -> Block:
+    columns = []
+    for rb in row_blocks:
+        cols = _row_columns(rb) or []
+        for c in cols:
+            if not any(abs(c - x) <= 10 for x in columns):
+                columns.append(c)
+    columns.sort()
+    data = [_build_table_row(rb, columns) for rb in row_blocks]
+    xs = [caption.bbox[0], *[rb.bbox[0] for rb in row_blocks]]
+    ys = [caption.bbox[1], *[rb.bbox[1] for rb in row_blocks]]
+    xe = [caption.bbox[2], *[rb.bbox[2] for rb in row_blocks]]
+    ye = [caption.bbox[3], *[rb.bbox[3] for rb in row_blocks]]
+    bbox = (min(xs), min(ys), max(xe), max(ye))
+    block = make_block(type="table", page_num=caption.page_num, bbox=bbox,
+                       lines=list(caption.lines), caption=caption.text, table_data=data)
+    for rb in row_blocks:
+        block.lines.extend(rb.lines)
+    return block
+
+
+def _find_span_table_blocks(blocks: List[Block]) -> Tuple[List[Block], List[Block]]:
+    """Текстовые таблицы: подпись «Table N» + следующие выровненные по колонкам строки.
+    Возвращает (merged_table_blocks, new_blocks), где подпись заменена на блок таблицы."""
+    table_blocks = []
+    merged_list = []
+    i = 0
+    n = len(blocks)
+    while i < n:
+        b = blocks[i]
+        if b.type == "text" and _is_table_caption(b.text):
+            rows = []
+            ref = None
+            j = i + 1
+            while j < n:
+                nb = blocks[j]
+                if nb.type != "text":
+                    break
+                cols = _row_columns(nb)
+                if cols is None:
+                    break
+                if ref is None:
+                    ref = cols
+                elif not _columns_align(ref, cols):
+                    break
+                rows.append(nb)
+                j += 1
+            if rows:
+                merged = _merge_span_table(b, rows)
+                table_blocks.append(merged)
+                merged_list.append(merged)
+                i = j
+                continue
+        merged_list.append(b)
+        i += 1
+    return table_blocks, merged_list
+
+
 def intersection_ratio(block_bbox, table_bbox):
     x0 = max(block_bbox[0], table_bbox[0])
     y0 = max(block_bbox[1], table_bbox[1])
@@ -542,37 +673,129 @@ def mark_table_regions(blocks: List[Block]) -> int:
     """Помечает как таблицы блоки «Table N. ...» и следующие за ними ячейки."""
     marked = 0
     i = 0
-    while i < len(blocks):
+    n = len(blocks)
+    while i < n:
         b = blocks[i]
-        if b.type not in ("text", "heading", "table"):
+        if b is None or b.type not in ("text", "heading", "table"):
             i += 1
             continue
-        if not TABLE_CAPTION_RE.match(b.text):
+        if b.table_data:
             i += 1
+            continue
+        if not _is_table_caption(b.text):
+            i += 1
+            continue
+        j = i + 1
+        nb = blocks[j] if j < n else None
+        if nb is not None and nb.type == "table" and nb.table_data:
+            nb.caption = b.text
+            blocks[i] = None
+            marked += 1
+            i = j
             continue
         if b.type != "table":
             b.type = "table"
             marked += 1
+        rows = []
+        ref = None
         j = i + 1
-        while j < len(blocks):
+        while j < n:
             nb = blocks[j]
-            if nb.type not in ("text", "paragraph", "list"):
+            if nb is None or nb.type not in ("text", "paragraph", "list"):
                 break
+            cols = _row_columns(nb)
+            if cols is not None and (ref is None or _columns_align(ref, cols)):
+                if ref is None:
+                    ref = cols
+                rows.append(nb)
+                marked += 1
+                j += 1
+                continue
             if _heuristic_table_data(nb.text) is not None or _looks_like_table_data(nb.text):
-                nb.type = "table"
+                rows.append(nb)
                 marked += 1
                 j += 1
             else:
                 break
+        if rows:
+            merged = _merge_span_table(b, rows)
+            b.bbox = merged.bbox
+            b.lines = merged.lines
+            b.caption = merged.caption
+            b.table_data = merged.table_data
         i = j
     return marked
+
+
+def _is_table_caption(text: str) -> bool:
+    """Подпись таблицы: «Table N | ...» (или короткий заголовок без разделителя)."""
+    if not text:
+        return False
+    if TABLE_CAPTION_STRICT_RE.match(text):
+        return True
+    if not TABLE_CAPTION_RE.match(text):
+        return False
+    return len(text) <= 120 and len(text.split()) <= 15
+
+
+def _is_figure_caption(text: str) -> bool:
+    """Подпись рисунка: «Fig. N | ...», «Figure 3. ...» (якорно, не просто упоминание)."""
+    if not text:
+        return False
+    if not FIGURE_CAPTION_RE.match(text):
+        return False
+    if FIGURE_CAPTION_STRICT_RE.match(text):
+        return True
+    rest = FIGURE_CAPTION_RE.sub('', text, count=1).lstrip()
+    if not rest:
+        return False
+    if len(text) > 160:
+        return False
+    if re.search(r'\b(?:illustrates?|shows?|depicts?|displays?|demonstrates?|presents?|'
+                 r'изобража\w*|показыва\w*|иллюстрир\w*)\b', text, re.I):
+        return False
+    return True
+
+
+def _rect_gap(a, b) -> float:
+    dx = max(0.0, max(a[0], b[0]) - min(a[2], b[2]))
+    dy = max(0.0, max(a[1], b[1]) - min(a[3], b[3]))
+    return max(dx, dy)
+
+
+def _union_rects(rects) -> fitz.Rect:
+    return fitz.Rect(min(r.x0 for r in rects), min(r.y0 for r in rects),
+                     max(r.x1 for r in rects), max(r.y1 for r in rects))
+
+
+def _cluster_drawing_rects(rects: List[fitz.Rect], gap: float = 6.0) -> List[List[fitz.Rect]]:
+    clusters = []
+    for r in sorted(rects, key=lambda x: (x.y0, x.x0)):
+        placed = False
+        for cl in clusters:
+            if _rect_gap(_union_rects(cl), (r.x0, r.y0, r.x1, r.y1)) <= gap:
+                cl.append(r)
+                placed = True
+                break
+        if not placed:
+            clusters.append([r])
+    return clusters
+
+
+def _overlaps_any(rect: fitz.Rect, others, ratio: float = 0.4) -> bool:
+    a = rect.get_area() or 1.0
+    for o in others:
+        inter = fitz.Rect(rect) & fitz.Rect(o)
+        if not inter.is_empty and inter.get_area() / a > ratio:
+            return True
+    return False
 
 
 def extract_images(page: fitz.Page, page_num: int, text_blocks: List[Block]) -> Tuple[List[Block], List[Block]]:
     image_list = page.get_images(full=True)
     figure_blocks = []
     caption_ids = set()
-    fig_index = 0
+    candidates = [(i, b) for i, b in enumerate(text_blocks) if _is_figure_caption(b.text)]
     for img in image_list:
         xref = img[0]
         try:
@@ -587,23 +810,81 @@ def extract_images(page: fitz.Page, page_num: int, text_blocks: List[Block]) -> 
         rects = page.get_image_rects(xref)
         if not rects:
             continue
-        img_bbox = rects[0]
+        img_bbox = fitz.Rect(rects[0])
+        if img_bbox.get_area() < 300:
+            continue
         image_data = base64.b64encode(data).decode()
         caption = None
-        for idx, block in enumerate(text_blocks):
+        cap_idx = -1
+        best_dist = CAPTION_DIST_THRESHOLD
+        for idx, block in candidates:
             if idx in caption_ids:
                 continue
-            bbox = block.bbox
-            if abs(bbox[3] - img_bbox[1]) < 80 or abs(img_bbox[3] - bbox[1]) < 80:
-                text = block.text
-                if CAPTION_RE.search(text):
-                    caption = text
-                    caption_ids.add(idx)
-                    break
-        fig_block = make_block(type="figure", page_num=page_num, bbox=img_bbox,
+            d = _rect_gap(img_bbox, block.bbox)
+            if d < best_dist:
+                best_dist = d
+                caption = block.text
+                cap_idx = idx
+        if cap_idx >= 0:
+            caption_ids.add(cap_idx)
+        fig_block = make_block(type="figure", page_num=page_num, bbox=tuple(img_bbox),
                                image_data=image_data, image_ext=ext, caption=caption)
         figure_blocks.append(fig_block)
-        fig_index += 1
+    remaining = [b for i, b in enumerate(text_blocks) if i not in caption_ids]
+    return figure_blocks, remaining
+
+
+def extract_vector_figures(page: fitz.Page, page_num: int, text_blocks: List[Block],
+                           used_bboxes=(), table_bboxes=(), dpi: int = 150) -> Tuple[List[Block], List[Block]]:
+    """Извлекает векторные фигуры (drawings): кластеризует области отрисовки,
+    исключает таблицы/растровые изображения и рендерит регион как PNG."""
+    draw_rects = []
+    for d in page.get_drawings():
+        r = fitz.Rect(d["rect"])
+        if r.width < 2 or r.height < 2:
+            continue
+        if r.width > page.rect.width * 0.95 and r.height > page.rect.height * 0.95:
+            continue
+        draw_rects.append(r)
+    if not draw_rects:
+        return [], text_blocks
+    clusters = _cluster_drawing_rects(draw_rects, gap=6)
+    table_rects = [fitz.Rect(b) for b in table_bboxes]
+    used_rects = [fitz.Rect(b) for b in used_bboxes]
+    page_w, page_h = page.rect.width, page.rect.height
+    candidates = [(i, b) for i, b in enumerate(text_blocks) if _is_figure_caption(b.text)]
+    figure_blocks = []
+    caption_ids = set()
+    for cl in clusters:
+        rect = _union_rects(cl)
+        if rect.width < 30 or rect.height < 20 or rect.get_area() < 1500:
+            continue
+        if rect.width > page_w * 0.6 and rect.height < page_h * 0.15:
+            continue
+        if _overlaps_any(rect, table_rects, 0.4) or _overlaps_any(rect, used_rects, 0.4):
+            continue
+        caption = None
+        cap_idx = -1
+        best_dist = CAPTION_DIST_THRESHOLD
+        for idx, b in candidates:
+            if idx in caption_ids:
+                continue
+            d = _rect_gap(rect, b.bbox)
+            if d < best_dist:
+                best_dist = d
+                caption = b.text
+                cap_idx = idx
+        if caption is None:
+            continue
+        caption_ids.add(cap_idx)
+        try:
+            pix = page.get_pixmap(matrix=fitz.Matrix(dpi / 72, dpi / 72), clip=rect, alpha=False)
+            image_data = base64.b64encode(pix.tobytes("png")).decode()
+        except Exception as e:
+            logger.warning(f"   Рендер векторной фигуры (стр. {page_num}): {e}")
+            continue
+        figure_blocks.append(make_block(type="figure", page_num=page_num, bbox=tuple(rect),
+                                        image_data=image_data, image_ext="png", caption=caption))
     remaining = [b for i, b in enumerate(text_blocks) if i not in caption_ids]
     return figure_blocks, remaining
 
@@ -1688,6 +1969,7 @@ p { line-height: 1.7; margin: 0 0 10px; text-align: justify; }
 .ref-link { color: #60a5fa; font-weight: bold; }
 .table-wrap tbody tr:nth-child(even) td { background: #16213a; }
 .table-pre { white-space: pre-wrap; font-family: 'Courier New', monospace; font-size: 0.85em; margin: 8px 0; }
+.table-caption { font-style: italic; color: #94a3b8; font-size: 0.85em; margin: 8px 0; }
 .toc { background: #1e293b; border: 1px solid #334155; border-radius: 8px; padding: 14px 20px; margin-bottom: 20px; }
 .toc ul { list-style: none; margin: 6px 0 0; padding-left: 18px; }
 .toc > ul { padding-left: 0; }
@@ -1728,6 +2010,7 @@ p { line-height: 1.7; margin: 0 0 10px; text-align: justify; color: #111827; }
 .ref-link { color: #2563eb; font-weight: bold; }
 .table-wrap tbody tr:nth-child(even) td { background: #f9fafb; }
 .table-pre { white-space: pre-wrap; font-family: 'Courier New', monospace; font-size: 0.85em; margin: 8px 0; }
+.table-caption { font-style: italic; color: #6b7280; font-size: 0.85em; margin: 8px 0; }
 .toc { background: #f8fafc; border: 1px solid #e5e7eb; border-radius: 8px; padding: 14px 20px; margin-bottom: 20px; }
 .toc ul { list-style: none; margin: 6px 0 0; padding-left: 18px; }
 .toc > ul { padding-left: 0; }
@@ -1791,7 +2074,10 @@ def _block_html(block: Block, in_ref: bool = False) -> str:
     if bt == 'table':
         if block.table_data:
             rows = block.table_data
-            out = ['<div class="table-wrap"><table>\n']
+            out = []
+            if block.caption:
+                out.append(f'<div class="table-caption">{trans_html(block.caption)}</div>\n')
+            out.append('<div class="table-wrap"><table>\n')
             for idx, row in enumerate(rows[:20]):
                 tag = 'th' if idx == 0 else 'td'
                 if idx == 0:
@@ -2004,19 +2290,44 @@ def process_pdf(
         doc = fitz.open(pdf_path)
         for page in pages:
             text_blocks = [b for b in page.blocks if b.type == "text"]
+            non_text = [b for b in page.blocks if b.type != "text"]
             fitz_page = doc[page.num - 1]
+            table_blocks = []
+            table_bboxes = []
+            try:
+                table_blocks = extract_tables(fitz_page, page.num)
+                table_bboxes.extend(tb.bbox for tb in table_blocks)
+                total_tables += len(table_blocks)
+            except Exception as e:
+                logger.warning(f"Ошибка извлечения таблиц: {e}")
+            try:
+                span_tables, text_blocks = _find_span_table_blocks(text_blocks)
+                if span_tables and table_blocks:
+                    covered = [i for i, tb in enumerate(table_blocks)
+                               if any(_rect_gap(tb.bbox, st.bbox) <= 5 for st in span_tables)]
+                    for i in reversed(covered):
+                        table_blocks.pop(i)
+                    total_tables -= len(covered)
+                table_bboxes.extend(tb.bbox for tb in span_tables)
+                total_tables += len(span_tables)
+            except Exception as e:
+                logger.warning(f"Ошибка распознавания текстовых таблиц: {e}")
+            figure_blocks = []
             try:
                 figure_blocks, text_blocks = extract_images(fitz_page, page.num, text_blocks)
-                page.blocks = [b for b in page.blocks if b.type != "text"] + text_blocks + figure_blocks
                 total_images += len(figure_blocks)
             except Exception as e:
                 logger.warning(f"Ошибка извлечения изображений: {e}")
             try:
-                table_blocks = extract_tables(fitz_page, page.num)
-                page.blocks.extend(table_blocks)
-                total_tables += len(table_blocks)
+                used_bboxes = [fb.bbox for fb in figure_blocks]
+                vector_blocks, text_blocks = extract_vector_figures(
+                    fitz_page, page.num, text_blocks,
+                    used_bboxes=used_bboxes, table_bboxes=table_bboxes)
+                figure_blocks.extend(vector_blocks)
+                total_images += len(vector_blocks)
             except Exception as e:
-                logger.warning(f"Ошибка извлечения таблиц: {e}")
+                logger.warning(f"Ошибка извлечения векторных фигур: {e}")
+            page.blocks = non_text + text_blocks + table_blocks + figure_blocks
         doc.close()
     logger.info(f"   Извлечено {len(pages)} стр., {total_images} изобр., {total_tables} табл.")
 
@@ -2057,7 +2368,8 @@ def process_pdf(
             heuristic_table_blocks(page.blocks)
             mark_table_regions(page.blocks)
             page.blocks = [b for b in page.blocks
-                           if b.type != "empty"
+                           if b is not None
+                           and b.type != "empty"
                            and not (b.type == "table" and b.table_data is None and not b.text.strip())]
 
     if summary_mode:
