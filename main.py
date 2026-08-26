@@ -60,6 +60,10 @@ warnings.filterwarnings("ignore")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
+# ---- Глобальный флаг прерывания (для корректной остановки по Ctrl+C / клавише) ----
+STOP_EVENT = threading.Event()
+_watchdog_started = False
+
 # ---- ML классификатор (опционально) ----
 # =========================================================
 # .env / keys.env загрузка
@@ -116,20 +120,20 @@ def stage_timer(name: str, timings: Optional[Dict[str, float]] = None):
 RE_WHITESPACE = re.compile(r'[ \t]+')
 RE_HYPHEN_BREAK = re.compile(r'(\w+)-\s*\n\s*(\w+)')
 
-REF_HEADING_RE = re.compile(
-    r'^\s*(References?|Reference\s+list|References?\s+and\s+notes?|'
+# Общий каркас заголовков списка литературы (используется в двух регэкспах ниже)
+_REF_HEADING_CORE = (
+    r'References?|Reference\s+list|References?\s+and\s+notes?|'
     r'Bibliography|Библиография|Библиографический\s+список|'
     r'Литература|Список\s+литературы|Список\s+использованной\s+литературы|'
     r'Список\s+использованных\s+источников|Список\s+источников|'
-    r'Использованная\s+литература|Источники)\s*[:.]?\s*$', re.IGNORECASE
+    r'Использованная\s+литература|Источники'
+)
+REF_HEADING_RE = re.compile(
+    r'^\s*(' + _REF_HEADING_CORE + r')\s*[:.]?\s*$', re.IGNORECASE
 )
 # Заголовок литературы, за которым сразу идёт первая запись списка
 REF_HEADING_PREFIX_RE = re.compile(
-    r'^\s*(References?|Reference\s+list|References?\s+and\s+notes?|'
-    r'Bibliography|Библиография|Библиографический\s+список|'
-    r'Литература|Список\s+литературы|Список\s+использованной\s+литературы|'
-    r'Список\s+использованных\s+источников|Список\s+источников|'
-    r'Использованная\s+литература|Источники)\s*[:.]?\s+(.+)$', re.IGNORECASE
+    r'^\s*(' + _REF_HEADING_CORE + r')\s*[:.]?\s+(.+)$', re.IGNORECASE
 )
 # Заголовки «хвоста» статьи, после которых список литературы заканчивается
 BACK_MATTER_RE = re.compile(
@@ -217,7 +221,61 @@ def _backoff(attempt: int, base: float = 3.0, max_delay: float = 30.0) -> None:
     if attempt == 0:
         return
     delay = min(base * (2 ** (attempt - 1)) + random.uniform(0, 1), max_delay)
-    time.sleep(delay)
+    _interruptible_sleep(delay)
+
+
+def _interruptible_sleep(delay: float, step: float = 0.5) -> None:
+    """sleep, прерываемый по STOP_EVENT (чтобы Ctrl+C/клавиша останавливали ожидание)."""
+    remaining = delay
+    while remaining > 0 and not STOP_EVENT.is_set():
+        time.sleep(min(step, remaining))
+        remaining -= step
+
+
+class _DaemonThreadPool(ThreadPoolExecutor):
+    """ThreadPoolExecutor для воркеров перевода.
+
+    Ранее здесь принудительно выставлялся daemon-флаг у уже запущенных
+    потоков, но в Python 3.13 это вызывает RuntimeError
+    ("cannot set daemon status of active thread"), из-за чего executor.submit
+    падал и ни одна задача перевода не выполнялась. Daemon-режим теперь не
+    трогаем; корректное завершение потоков обеспечивается shutdown(wait=False)
+    в finally (см. translate_blocks)."""
+    pass
+
+
+def _start_keyboard_watchdog():
+    """Поток-сторож: на Windows ловит нажатие 'q'/'Q'/Esc/Ctrl-C и ставит STOP_EVENT.
+    Обычный KeyboardInterrupt иногда не доходит до основного потока из-за воркеров."""
+    global _watchdog_started
+    if _watchdog_started:
+        return
+    _watchdog_started = True
+    if STOP_EVENT.is_set():
+        return
+    if os.name == 'nt':
+        try:
+            import msvcrt
+        except ImportError:
+            return
+
+        def _watch():
+            while not STOP_EVENT.is_set():
+                try:
+                    if msvcrt.kbhit():
+                        ch = msvcrt.getwch()
+                        if ch in ('q', 'Q', '\x1b', '\x03'):
+                            logger.warning("⏹ Прерывание по клавише, остановка...")
+                            STOP_EVENT.set()
+                    else:
+                        time.sleep(0.1)
+                except Exception:
+                    break
+
+        threading.Thread(target=_watch, daemon=True).start()
+    else:
+        # На POSIX полагаемся на обработчик SIGINT (устанавливает STOP_EVENT).
+        pass
 
 
 # =========================================================
@@ -264,15 +322,6 @@ class Page:
     blocks: List[Block] = field(default_factory=list)
     width: float = 0.0
     height: float = 0.0
-
-
-@dataclass
-class PDFBlock:
-    text: str
-    block_type: str
-    page_num: int
-    font_size: float = 12.0
-    translated_text: Optional[str] = None
 
 
 # ---- Фабрики ----
@@ -879,12 +928,24 @@ def extract_vector_figures(page: fitz.Page, page_num: int, text_blocks: List[Blo
         if caption is None:
             continue
         caption_ids.add(cap_idx)
+
+        # ---------- ИСПРАВЛЕНИЕ: двойная попытка рендеринга с csRGB и без ----------
+        image_data = None
         try:
-            pix = page.get_pixmap(matrix=fitz.Matrix(dpi / 72, dpi / 72), clip=rect, alpha=False)
+            # Первая попытка с явным csRGB (исправляет ошибки цветового профиля)
+            pix = page.get_pixmap(matrix=fitz.Matrix(dpi / 72, dpi / 72),
+                                  clip=rect, alpha=False, colorspace=fitz.csRGB)
             image_data = base64.b64encode(pix.tobytes("png")).decode()
-        except Exception as e:
-            logger.warning(f"   Рендер векторной фигуры (стр. {page_num}): {e}")
-            continue
+        except Exception as e1:
+            try:
+                # Вторая попытка без указания colorspace
+                pix = page.get_pixmap(matrix=fitz.Matrix(dpi / 72, dpi / 72),
+                                      clip=rect, alpha=False)
+                image_data = base64.b64encode(pix.tobytes("png")).decode()
+            except Exception as e2:
+                logger.warning(f"   Рендер векторной фигуры (стр. {page_num}): {e2}")
+                continue  # пропускаем этот кластер
+
         figure_blocks.append(make_block(type="figure", page_num=page_num, bbox=tuple(rect),
                                         image_data=image_data, image_ext="png", caption=caption))
     remaining = [b for i, b in enumerate(text_blocks) if i not in caption_ids]
@@ -992,8 +1053,16 @@ def _system_prompt(lang: str, glossary: Optional[Dict[str, str]] = None) -> str:
 # ЗАЩИТА ССЫЛОК НА ЛИТЕРАТУРУ
 # =========================================================
 REF_PATTERN = re.compile(r'\[(?:[0-9][0-9,\s;\-–—]*|[A-Za-z][A-Za-z0-9-]*)\]')
-REF_HIGHLIGHT_RE = re.compile(r'\[(?:[0-9][0-9,\s;\-–—]*|[A-Za-z][A-Za-z0-9-]*)\]')
-_REF_PH_RE = re.compile(r'(?<![A-Za-z0-9_])\[?\[?REF_?(\d+)\]?\]?(?![A-Za-z0-9_])')
+# Любой плейсхолдер ссылки, который может выдать модель: [[REF0]], [[REFn]],
+# [[ REFn ]] и т.п. translategemma нормализует цитаты именно в такой вид.
+_REF_TOKEN_RE = re.compile(r'\[\[\s*REF[^\]]*\]\]')
+# Для защиты захватываем не только [1], [Chouchou2014], но и автор-годные
+# цитаты в скобках (Smith et al., 2014), которые REF_PATTERN (только [...]).
+# не ловит, но модель всё равно нормализует в [[REFn]] и ломает ссылки.
+_REF_PAREN_RE = re.compile(
+    r'\(\s*[A-Za-z][^()]{0,60}?\b(?:19|20)\d{2}[a-z]?\s*\)'
+)
+REF_PATTERN_PROTECT = re.compile(REF_PATTERN.pattern + r'|' + _REF_PAREN_RE.pattern)
 
 
 def protect_refs(text: str) -> Tuple[str, Dict[str, str]]:
@@ -1002,27 +1071,41 @@ def protect_refs(text: str) -> Tuple[str, Dict[str, str]]:
     def repl(m) -> str:
         key = f"[[REF{len(refs)}]]"
         refs[key] = m.group(0)
-        return key
+        return f" {key} "
 
-    return REF_PATTERN.sub(repl, text), refs
+    return REF_PATTERN_PROTECT.sub(repl, text), refs
 
 
 def restore_refs(text: str, refs: Dict[str, str]) -> str:
+    """Восстанавливает оригинальные цитаты.
+
+    translategemma (и ряд моделей) нормализует цитаты в единый вид [[REFn]]
+    (буква n вместо номера) либо сохраняет номер [[REF0]]. Поэтому точного
+    совпадения по номеру недостаточно — сопоставляем плейсхолдеры с оригиналами
+    ПО ПОРЯДКУ ПОЯВЛЕНИЯ, что корректно в обоих случаях.
+    """
     if not refs:
         return text
-    for ph, orig in refs.items():
-        text = text.replace(ph, orig)
-    by_index = {i: orig for i, orig in enumerate(refs.values())}
-
-    def rep(m) -> str:
-        idx = int(m.group(1))
-        return by_index.get(idx, m.group(0))
-
-    return _REF_PH_RE.sub(rep, text)
+    origs = list(refs.values())
+    # 1) точные плейсхолдеры с номером [[REF0]] -> оригинал по индексу
+    for i, orig in enumerate(origs):
+        text = text.replace(f"[[REF{i}]]", orig)
+    # 2) порядковое сопоставление оставшихся [[REF...]] токенов
+    remaining = _REF_TOKEN_RE.findall(text)
+    if remaining:
+        unrestored = [o for o in origs if o not in text]
+        for tok in remaining:
+            if not unrestored:
+                break
+            text = text.replace(tok, unrestored.pop(0), 1)
+    # 3) сетка безопасности: любые необратимые [[REF...]] (например,
+    # галлюцинированные моделью) удаляем, чтобы они не попали в итог.
+    text = _REF_TOKEN_RE.sub("", text)
+    return text
 
 
 def highlight_refs(escaped_text: str) -> str:
-    return REF_HIGHLIGHT_RE.sub(
+    return REF_PATTERN.sub(
         lambda m: f'<span class="ref-link">{m.group(0)}</span>', escaped_text
     )
 
@@ -1128,25 +1211,82 @@ class GoogleTranslator:
         self.can_generate = False
         self.session = _make_session()
         self.session.headers.update({"User-Agent": "Mozilla/5.0"})
-        self.rate_limiter = RateLimiter(max_requests_per_second=3)
+        # ИСПРАВЛЕНИЕ: уменьшаем частоту до 1 запроса в секунду (было 3)
+        self.rate_limiter = RateLimiter(max_requests_per_second=0.5)
+        # Прогрессивное увеличение задержки при 429 (счётчик между вызовами)
+        self._rate_limit_count = 0
+        self._429_max_retries = 8
+        # ГЛОБАЛЬНАЯ пауза: все воркер-потоки делят один экземпляр переводчика,
+        # поэтому 429 должен останавливать ВЕСЬ пул, а не только один поток.
+        self._cooldown_lock = threading.Lock()
+        self._cooldown_until = 0.0
 
-    def translate(self, text: str) -> Optional[str]:
+    def _wait_before_request(self) -> None:
+        """Блокирует поток до разрешённого момента: учитывает и rate limiter,
+        и глобальную паузу после 429 (чтобы пул не долбил сервер)."""
+        with self._cooldown_lock:
+            wait = max(0.0, self._cooldown_until - time.monotonic())
         self.rate_limiter.acquire()
-        try:
-            resp = self.session.get(
-                "https://translate.googleapis.com/translate_a/single",
-                params={"client": "gtx", "sl": "auto", "tl": self.target_lang,
-                        "dt": "t", "ie": "UTF-8", "oe": "UTF-8", "q": text},
-                timeout=120
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            parts = [p[0] for p in data[0] if p[0]]
-            result = " ".join(parts).strip()
-            return result if result else None
-        except Exception as e:
-            logger.warning(f"   Google Translate: {type(e).__name__}: {e}")
-            return None
+        if wait > 0:
+            _interruptible_sleep(wait)
+
+    def _set_cooldown(self, delay: float) -> None:
+        until = time.monotonic() + delay
+        with self._cooldown_lock:
+            if until > self._cooldown_until:
+                self._cooldown_until = until
+
+    def translate(self, text: str, glossary: Optional[Dict[str, str]] = None) -> Optional[str]:
+        attempt = 0
+        while True:
+            self._wait_before_request()
+            try:
+                resp = self.session.get(
+                    "https://translate.googleapis.com/translate_a/single",
+                    params={"client": "gtx", "sl": "auto", "tl": self.target_lang,
+                            "dt": "t", "ie": "UTF-8", "oe": "UTF-8", "q": text},
+                    timeout=120
+                )
+                if resp.status_code == 429:
+                    raise requests.exceptions.HTTPError(
+                        f"429 Client Error", response=resp)
+                resp.raise_for_status()
+                data = resp.json()
+                parts = [p[0] for p in data[0] if p[0]]
+                result = " ".join(parts).strip()
+                # успешный запрос сбрасывает прогрессивный счётчик задержки
+                self._rate_limit_count = 0
+                return result if result else None
+            except requests.exceptions.HTTPError as e:
+                if e.response is not None and e.response.status_code == 429:
+                    attempt += 1
+                    self._rate_limit_count += 1
+                    retry_after = e.response.headers.get('Retry-After')
+                    if retry_after and str(retry_after).isdigit():
+                        # сервер явно просит подождать
+                        delay = float(retry_after)
+                    else:
+                        # прогрессивное увеличение: 10s, 20s, 40s, 80s ... до 5 минут
+                        delay = min(10.0 * (2 ** (attempt - 1)),
+                                    300.0) + random.uniform(0, 2)
+                    logger.warning(
+                        f"   Google Translate: 429 Too Many Requests, "
+                        f"пауза {delay:.0f} сек (попытка {attempt}/{self._429_max_retries})"
+                    )
+                    # ставим глобальную паузу для ВСЕГО пула воркеров
+                    self._set_cooldown(delay)
+                    _interruptible_sleep(delay)
+                    if STOP_EVENT.is_set() or attempt >= self._429_max_retries:
+                        self._rate_limit_count = 0
+                        return None
+                    continue
+                else:
+                    status = e.response.status_code if e.response is not None else "?"
+                    logger.warning(f"   Google Translate: HTTP {status}")
+                    return None
+            except Exception as e:
+                logger.warning(f"   Google Translate: {type(e).__name__}")
+                return None
 
     def generate(self, prompt: str) -> Optional[str]:
         return None
@@ -1235,7 +1375,10 @@ class OpenRouterRotator:
                 err_str = str(e).lower()
                 if '429' in err_str or 'rate' in err_str or 'limit' in err_str:
                     self._exhausted_models[model] = time.time()
-                    time.sleep(5)
+                    resp = getattr(e, 'response', None)
+                    ra = getattr(resp, 'headers', {}).get('Retry-After') if resp else None
+                    delay = float(ra) if (ra and str(ra).isdigit()) else 5.0
+                    _interruptible_sleep(delay)
                     attempts += 1
                     continue
                 attempts += 1
@@ -1262,6 +1405,25 @@ class OpenRouterRotator:
             return None
 
 
+def _model_matches(expected: Optional[str], actual: Optional[str]) -> bool:
+    """Нестрогое сопоставление имени модели.
+
+    Сервер отдаёт в /v1/models полный путь к файлу (например,
+    '/home/ad/llm_models/translategemma-4b-it-Q4_K_M_GGUF.gguf'), а пользователь
+    может передавать короткое имя ('translate', 'translategemma', 'qwen3.5').
+    Считаем совпадением точное равенство либо вхождение одного имени в другое
+    (без учёта регистра и пути)."""
+    if not expected or not actual:
+        return False
+    e = expected.lower()
+    a = actual.lower()
+    if e == a:
+        return True
+    e_base = os.path.basename(e).lower()
+    a_base = os.path.basename(a).lower()
+    return any(sub in other for sub, other in ((e, a), (a, e), (e_base, a_base), (a_base, e_base)))
+
+
 class LlamaCppTranslator:
     def __init__(self, target_lang: str, api_base: str = "http://localhost:8080/v1",
                  expected_model: Optional[str] = None, auto_find: bool = True):
@@ -1278,7 +1440,7 @@ class LlamaCppTranslator:
             ok, models = self._check_server(api_base)
             if ok:
                 server_model = models[0] if models else "unknown"
-                if expected_model and server_model != expected_model:
+                if expected_model and not _model_matches(expected_model, server_model):
                     logger.warning(f"   На {api_base} загружена '{server_model}', а нужна '{expected_model}'")
                 else:
                     self.api_base = api_base.rstrip("/")
@@ -1294,7 +1456,7 @@ class LlamaCppTranslator:
                 self._loaded_model = servers[0]["model"]
                 self._server_ok = True
             else:
-                matched = [s for s in servers if s["model"] == expected_model]
+                matched = [s for s in servers if _model_matches(expected_model, s["model"])]
                 if matched:
                     self.api_base = matched[0]["url"]
                     self._loaded_model = matched[0]["model"]
@@ -1340,7 +1502,7 @@ class LlamaCppTranslator:
         return False, []
 
     def _call_api(self, messages: List[Dict[str, str]], temperature: float = 0.3,
-                  max_tokens: int = 4096) -> Optional[str]:
+                  max_tokens: int = 4096, timeout: int = 180) -> Optional[str]:
         if not self._server_ok:
             return None
         self.rate_limiter.acquire()
@@ -1348,8 +1510,12 @@ class LlamaCppTranslator:
             resp = requests.post(
                 f"{self.api_base}/chat/completions",
                 json={"model": self._loaded_model, "messages": messages,
-                      "temperature": temperature, "max_tokens": max_tokens, "stream": False},
-                timeout=120,
+                      "temperature": temperature, "max_tokens": max_tokens, "stream": False,
+                      # Отключаем режим "размышления" у reasoning-моделей (Qwen3.5 и т.п.):
+                      # иначе ответ целиком уходит в reasoning_content, а message.content
+                      # остаётся пустым -> перевод трактуется как None и сохраняется исходник.
+                      "chat_template_kwargs": {"enable_thinking": False}},
+                timeout=timeout,
             )
             if resp.status_code == 200:
                 content = resp.json().get("choices", [{}])[0].get("message", {}).get("content")
@@ -1359,13 +1525,18 @@ class LlamaCppTranslator:
         return None
 
     def translate(self, text: str, glossary: Optional[Dict[str, str]] = None) -> Optional[str]:
+        # translategemma (и ряд других локальных моделей) не останавливается досрочно и
+        # генерирует вплоть до max_tokens. На CPU скорость ~10-15 ток/с, поэтому слишком
+        # большой лимит приводит к генерации в сотни секунд и таймауту клиента. Ограничиваем
+        # разумным потолком, зависящим от длины входа.
+        max_tokens = max(256, min(1500, (len(text) + 40) // 2))
         return self._call_api([
             {"role": "system", "content": _system_prompt(self.target_lang, glossary)},
             {"role": "user", "content": text}
-        ])
+        ], max_tokens=max_tokens)
 
     def generate(self, prompt: str) -> Optional[str]:
-        return self._call_api([{"role": "user", "content": prompt}])
+        return self._call_api([{"role": "user", "content": prompt}], max_tokens=1024)
 
 
 # ---- Фабрика переводчиков ----
@@ -1431,6 +1602,7 @@ class TranslationCache:
         for sig in (signal.SIGTERM, signal.SIGINT):
             prev = signal.getsignal(sig)
             def _handler(signum, frame, _prev=prev):
+                STOP_EVENT.set()
                 self.save()
                 if callable(_prev):
                     _prev(signum, frame)
@@ -1483,23 +1655,34 @@ def translate_chunk_with_retry(chunk: str, translator, max_retries: int = 3,
     if len(chunk) < 3:
         return chunk
     for attempt in range(max_retries):
-        _backoff(attempt)
         try:
-            translated = translator.translate(chunk, glossary) if glossary else translator.translate(chunk)
+            translated = translator.translate(chunk, glossary)
             if translated and len(translated) >= 2 and translated.strip() != chunk.strip():
                 return translated.strip()
         except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 429:
+                retry_after = e.response.headers.get('Retry-After')
+                # Базовая задержка с экспоненциальным ростом и джиттером
+                base_delay = (2 ** attempt) * 2.0 + random.uniform(0, 1)
+                delay = float(retry_after) if retry_after else base_delay
+                delay = min(delay, 30.0)
+                logger.warning(f"[{translator.name}] 429 Too Many Requests, пауза {delay:.1f} сек")
+                _interruptible_sleep(delay)
+                continue
             if attempt == max_retries - 1:
-                logger.warning(f"[{translator.name}] HTTP {e.response.status_code}: {e}")
+                status = e.response.status_code if e.response is not None else "?"
+                logger.warning(f"[{translator.name}] HTTP {status}")
         except requests.exceptions.Timeout:
             if attempt == max_retries - 1:
                 logger.warning(f"[{translator.name}] Таймаут после {max_retries} попыток")
         except requests.exceptions.ConnectionError as e:
             if attempt == max_retries - 1:
-                logger.warning(f"[{translator.name}] Ошибка соединения: {e}")
+                logger.warning(f"[{translator.name}] Ошибка соединения: {type(e).__name__}")
         except Exception as e:
             if attempt == max_retries - 1:
-                logger.warning(f"[{translator.name}] Ошибка: {e}")
+                logger.warning(f"[{translator.name}] Ошибка: {type(e).__name__}")
+        # Общий бэкофф для остальных ошибок
+        _backoff(attempt, base=2.0, max_delay=20.0)
     return None
 
 
@@ -1524,7 +1707,7 @@ class TranslationPipeline:
         self._block_times = []
 
     BASE_SKIP_TYPES = ("figure", "table", "empty")
-    MAX_SECTION_CHARS = 6000
+    MAX_SECTION_CHARS = 3000
 
     def _skip_types(self) -> Tuple[str, ...]:
         return self.BASE_SKIP_TYPES + ("reference", "reference_heading")
@@ -1541,22 +1724,38 @@ class TranslationPipeline:
                 self.stats["cached"] += 1
             return cached
         t0 = time.time()
-        result = translate_chunk_with_retry(protected, self.translator, glossary=glossary)
+        # Локальный движок: больше попыток и НЕ сразу уходим в Google.
+        # Только исчерпав повторы, используем fallback (Google).
+        local_retries = 8 if self.is_local else 3
+        result = translate_chunk_with_retry(protected, self.translator,
+                                            max_retries=local_retries, glossary=glossary)
         if not result and self.fallback:
+            logger.info(f"   Локальный перевод не дал результата за {local_retries} попыток, "
+                        f"переключаюсь на fallback ({self.fallback.name})")
             result = translate_chunk_with_retry(protected, self.fallback, glossary=glossary)
         if result and refs:
             result = restore_refs(result, refs)
             missing = [orig for orig in refs.values() if orig not in result]
             if missing:
-                logger.warning(f"   Ссылки {missing} потеряны при переводе, повторная попытка")
-                result2 = translate_chunk_with_retry(text, self.translator, glossary=glossary)
+                # повторная попытка на ре-защищённом тексте (исправление: ранее
+                # переводился сырой text, из-за чего restore_refs не срабатывал)
+                protected2, _ = protect_refs(text)
+                result2 = translate_chunk_with_retry(protected2, self.translator,
+                                                     max_retries=local_retries, glossary=glossary)
+                if not result2 and self.fallback:
+                    result2 = translate_chunk_with_retry(protected2, self.fallback, glossary=glossary)
                 if result2:
                     result2 = restore_refs(result2, refs)
-                    if all(orig in result2 for orig in refs.values()):
-                        result = result2
-                    else:
-                        missing2 = [orig for orig in refs.values() if orig not in result2]
-                        logger.warning(f"   Ссылки {missing2} всё ещё потеряны после повтора")
+                base = result2 if result2 else result
+                missing2 = [orig for orig in refs.values() if orig not in base]
+                if missing2:
+                    result = self._reinsert_missing_refs(base, protected2, refs, missing2)
+                    missing = [orig for orig in refs.values() if orig not in result]
+                else:
+                    result = result2
+                    missing = []
+            if missing:
+                logger.warning(f"   Ссылки {missing} восстановлены и вставлены в текст")
         if result and self.refine and self.is_local and getattr(self.translator, 'can_generate', False):
             refined = self._refine(result, lang)
             if refined:
@@ -1575,6 +1774,43 @@ class TranslationPipeline:
             with self._stats_lock:
                 self.stats["failed"] += 1
         return result
+
+    def _reinsert_missing_refs(self, result: str, protected: str,
+                               refs: Dict[str, str], missing: List[str]) -> str:
+        """Вставляет пропавшие ссылки обратно в текст, сохраняя примерную позицию."""
+        total = len(protected) or 1
+        inserts = []
+        for ph, orig in refs.items():
+            if orig in missing:
+                idx = protected.find(ph)
+                if idx >= 0:
+                    inserts.append((idx / total, orig))
+        r = result or ""
+        if not inserts:
+            return r + " " + " ".join(missing)
+        inserts.sort(key=lambda x: x[0])
+
+        def _snap(pos: int) -> int:
+            if pos <= 0 or pos >= len(r):
+                return max(0, min(pos, len(r)))
+            if r[pos].isspace() or r[pos - 1].isspace():
+                return pos
+            back = r.rfind(' ', 0, pos)
+            fwd = r.find(' ', pos)
+            if back == -1 and fwd == -1:
+                return pos
+            if back == -1:
+                return fwd
+            if fwd == -1:
+                return back + 1
+            return back + 1 if (pos - back) <= (fwd - pos) else fwd
+
+        points = [(int(ratio * len(r)), orig) for ratio, orig in inserts]
+        points.sort(reverse=True)
+        for pos, orig in points:
+            pos = _snap(max(0, min(pos, len(r))))
+            r = r[:pos] + " " + orig + " " + r[pos:]
+        return r
 
     def _refine(self, translated: str, lang: str) -> Optional[str]:
         prompt = REFINE_PROMPT.format(lang=lang) + "\n\n" + translated
@@ -1683,7 +1919,7 @@ class TranslationPipeline:
 
         glossary = None
         if getattr(self.translator, 'can_generate', False):
-            sample = "\n\n".join(b.text for b in translatable)[:20000]
+            sample = "\n\n".join(b.text for b in translatable)[:6000]
             if sample:
                 glossary = extract_glossary(sample, self.translator, lang, self.cache)
                 if glossary and not quiet:
@@ -1702,20 +1938,30 @@ class TranslationPipeline:
             sections.append(current)
 
         tasks = []
-        for sec in sections:
-            if sum(len(b.text) for b in sec) <= self.MAX_SECTION_CHARS:
-                tasks.append(sec)
-                continue
-            group = []
-            group_len = 0
-            for b in sec:
-                if group and group_len + len(b.text) > self.MAX_SECTION_CHARS:
-                    tasks.append(group)
-                    group = [b]
-                    group_len = len(b.text)
-                else:
-                    group.append(b)
-                    group_len += len(b.text)
+        if self.is_local:
+            # Локальный движок (CPU, однослотовый сервер): переводим строго по
+            # абзацам. Группировка здесь невыгодна — модель редко возвращает ровно
+            # N абзацев, проверка «число абзацев совпало» не проходит и запрос
+            # дублируется построчным переводом, а длинные сгруппированные запросы
+            # генерируют до max_tokens и подвисают.
+            for sec in sections:
+                for b in sec:
+                    tasks.append([b])
+        else:
+            for sec in sections:
+                if sum(len(b.text) for b in sec) <= self.MAX_SECTION_CHARS:
+                    tasks.append(sec)
+                    continue
+                group = []
+                group_len = 0
+                for b in sec:
+                    if group and group_len + len(b.text) > self.MAX_SECTION_CHARS:
+                        tasks.append(group)
+                        group = [b]
+                        group_len = len(b.text)
+                    else:
+                        group.append(b)
+                        group_len += len(b.text)
             if group:
                 tasks.append(group)
 
@@ -1729,12 +1975,18 @@ class TranslationPipeline:
 
         def _work(group):
             nonlocal done
+            if STOP_EVENT.is_set():
+                for b in group:
+                    b.translation = b.text
+                return
             if len(group) == 1:
                 b = group[0]
                 result = self._translate_one(b.text, lang, glossary)
                 b.translation = result if result else b.text
             else:
                 self._translate_group(group, lang, glossary, quiet)
+            if STOP_EVENT.is_set():
+                return
             with lock:
                 done += 1
                 if TQDM and not quiet:
@@ -1753,18 +2005,38 @@ class TranslationPipeline:
             pbar = tqdm(total=total, desc="🌐 Перевод", unit="блок",
                         bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]")
 
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+        _start_keyboard_watchdog()
+        executor = _DaemonThreadPool(max_workers=self.max_workers)
+        futures = {}
+        try:
             futures = {executor.submit(_work, g): g for g in tasks}
-            try:
-                for future in as_completed(futures, timeout=self.timeout):
+        except Exception:
+            pass
+        try:
+            for future in as_completed(futures):
+                if STOP_EVENT.is_set():
+                    break
+                try:
                     future.result()
-            except TimeoutError:
-                logger.warning(f"Превышен таймаут ({self.timeout} сек)")
-                for f in futures:
-                    f.cancel()
-            finally:
-                if TQDM and not quiet:
-                    pbar.close()
+                except Exception:
+                    pass
+        except KeyboardInterrupt:
+            STOP_EVENT.set()
+            logger.warning("⏹ Прервано пользователем (Ctrl+C)")
+        finally:
+            for f in futures:
+                f.cancel()
+            try:
+                executor.shutdown(wait=False, cancel_futures=True)
+            except TypeError:
+                executor.shutdown(wait=False)
+            if STOP_EVENT.is_set():
+                # Восстанавливаем оригинал для блоков, перевод которых не завершён
+                for b in blocks:
+                    if b.translation is None and b.type not in skip_types:
+                        b.translation = b.text
+            if TQDM and not quiet:
+                pbar.close()
 
         if not quiet:
             elapsed = time.time() - self._start_time
@@ -2050,7 +2322,8 @@ def _reference_entries(block: Block) -> List[str]:
     return [" ".join(e) for e in entries]
 
 
-def _block_html(block: Block, in_ref: bool = False) -> str:
+# ИСПРАВЛЕНИЕ: убран неиспользуемый параметр in_ref
+def _block_html(block: Block) -> str:
     e = html_mod.escape
     bt = block.type
     trans = block.translation or block.text
@@ -2173,7 +2446,7 @@ HTML_TEMPLATE = """
     <details class="page" open>
         <summary>📄 Страница {{ page.num }}</summary>
         {% for block in page.blocks %}
-            {{ _block_html(block, False) | safe }}
+            {{ _block_html(block) | safe }}
         {% endfor %}
     </details>
     {% endfor %}
@@ -2336,6 +2609,14 @@ def process_pdf(
             except Exception as e:
                 logger.warning(f"Ошибка извлечения векторных фигур: {e}")
             page.blocks = non_text + text_blocks + table_blocks + figure_blocks
+        # Проверка наличия текста
+        total_text = ""
+        for page in pages:
+            for block in page.blocks:
+                total_text += block.text
+        if len(total_text.strip()) < 10:
+            logger.error("❌ В PDF не найден текст (возможно, файл состоит только из изображений или отсканирован).")
+            sys.exit(1)            
         doc.close()
     logger.info(f"   Извлечено {len(pages)} стр., {total_images} изобр., {total_tables} табл.")
 
