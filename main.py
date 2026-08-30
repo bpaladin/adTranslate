@@ -2,13 +2,12 @@
 """
 PDF Translator — единый скрипт для перевода и реферирования PDF-документов.
 Поддерживает Google Translate, OpenRouter и локальный llama.cpp.
-Объединяет main2.py (ML-классификация, профилирование) и
-pdf_translator_online.py (protect/restore, retry, dark-тема HTML).
 """
 
 import os
 import sys
 import re
+import string
 import time
 import json
 import random
@@ -23,10 +22,11 @@ import warnings
 import html as html_mod
 import base64
 import contextlib
+import concurrent.futures
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any, Tuple
-from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED, TimeoutError
 
 import fitz
 import requests
@@ -47,27 +47,51 @@ try:
 except ImportError:
     TQDM = False
 
-__version__ = "1.0.0"
+__version__ = "1.1.1-fixes"
 
-# ---- Логирование ----
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
+# ---- Логирование с цветом ----
+class ColorFormatter(logging.Formatter):
+    grey = "\x1b[38;20m"
+    yellow = "\x1b[33;20m"
+    red = "\x1b[31;20m"
+    bold_red = "\x1b[31;1m"
+    blue = "\x1b[36;20m"
+    green = "\x1b[32;20m"
+    reset = "\x1b[0m"
+
+    def __init__(self, fmt):
+        super().__init__()
+        self.fmt = fmt
+        self.FORMATS = {
+            logging.DEBUG: self.grey + self.fmt + self.reset,
+            logging.INFO: self.blue + self.fmt + self.reset,
+            logging.WARNING: self.yellow + self.fmt + self.reset,
+            logging.ERROR: self.red + self.fmt + self.reset,
+            logging.CRITICAL: self.bold_red + self.fmt + self.reset
+        }
+
+    def format(self, record):
+        log_fmt = self.FORMATS.get(record.levelno)
+        formatter = logging.Formatter(log_fmt, datefmt='%H:%M:%S')
+        return formatter.format(record)
+
+if os.name == 'nt':
+    os.system('')  # Включаем поддержку ANSI в консоли Windows
+
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+handler = logging.StreamHandler()
+handler.setFormatter(ColorFormatter('%(asctime)s - %(levelname)s - %(message)s'))
+logger.addHandler(handler)
+logger.propagate = False
+
 warnings.filterwarnings("ignore")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
-# ---- Глобальный флаг прерывания (для корректной остановки по Ctrl+C / клавише) ----
 STOP_EVENT = threading.Event()
 _watchdog_started = False
 
-# ---- ML классификатор (опционально) ----
-# =========================================================
-# .env / keys.env загрузка
-# =========================================================
 def _parse_env_file(path: Path):
     try:
         if not path.exists():
@@ -86,22 +110,55 @@ def _parse_env_file(path: Path):
     except Exception as e:
         logger.warning(f"Ошибка загрузки {path.name}: {e}")
 
-
 def load_env_file():
     script_dir = Path(__file__).parent.absolute()
     for name in ('keys.env', '.env'):
         _parse_env_file(script_dir / name)
 
-
 load_env_file()
 
-# ---- API ключи ----
+DEFAULT_SETTINGS = {
+    "block_timeout": 900,
+    "request_timeout": 600,
+    "api_timeout": 120,
+    "model_cooldown_sec": 60,
+    "llama_max_retries": 3,
+    "llm_chunk_chars": 1800,
+    "llm_min_chunk_chars": 650,
+    "llm_rescue_min_chars": 220,
+}
+
+def load_settings(path: str = "settings.json") -> dict:
+    p = Path(path)
+    if p.exists():
+        try:
+            with open(p, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            merged = dict(DEFAULT_SETTINGS)
+            merged.update({k: v for k, v in data.items() if k in DEFAULT_SETTINGS})
+            return merged
+        except Exception as e:
+            logger.warning(f"Ошибка чтения {p.name}: {e} — используются умолчания")
+    try:
+        with open(p, 'w', encoding='utf-8') as f:
+            json.dump(DEFAULT_SETTINGS, f, indent=2, ensure_ascii=False)
+        logger.info(f"Создан файл настроек: {p.name}")
+    except Exception as e:
+        logger.debug(f"Не удалось создать {p.name}: {e}")
+    return dict(DEFAULT_SETTINGS)
+
+SETTINGS = load_settings()
+BLOCK_TIMEOUT = int(SETTINGS["block_timeout"])
+REQUEST_TIMEOUT = max(600, int(SETTINGS["request_timeout"]))
+API_TIMEOUT = SETTINGS["api_timeout"]
+MODEL_COOLDOWN_SEC = SETTINGS["model_cooldown_sec"]
+LLAMA_MAX_RETRIES = SETTINGS["llama_max_retries"]
+
 OPENAI_API_KEY = os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "google/gemma-4-31b-it:free")
-OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://openrouter.ai/api/v1")
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://sprutdock.ru/v1")
+DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "z-ai/glm-5.2:free")
+SPRUTDOCK_API_KEY = os.getenv("SPRUTDOCK_API_KEY") or OPENAI_API_KEY
 
-
-# ---- Профилирование ----
 @contextlib.contextmanager
 def stage_timer(name: str, timings: Optional[Dict[str, float]] = None):
     t0 = time.perf_counter()
@@ -113,29 +170,18 @@ def stage_timer(name: str, timings: Optional[Dict[str, float]] = None):
         if timings is not None:
             timings[name] = elapsed
 
-
-# =========================================================
-# РЕГУЛЯРНЫЕ ВЫРАЖЕНИЯ
-# =========================================================
 RE_WHITESPACE = re.compile(r'[ \t]+')
 RE_HYPHEN_BREAK = re.compile(r'(\w+)-\s*\n\s*(\w+)')
 
-# Общий каркас заголовков списка литературы (используется в двух регэкспах ниже)
-_REF_HEADING_CORE = (
+_REF_HEADING_ALT = (
     r'References?|Reference\s+list|References?\s+and\s+notes?|'
     r'Bibliography|Библиография|Библиографический\s+список|'
     r'Литература|Список\s+литературы|Список\s+использованной\s+литературы|'
     r'Список\s+использованных\s+источников|Список\s+источников|'
     r'Использованная\s+литература|Источники'
 )
-REF_HEADING_RE = re.compile(
-    r'^\s*(' + _REF_HEADING_CORE + r')\s*[:.]?\s*$', re.IGNORECASE
-)
-# Заголовок литературы, за которым сразу идёт первая запись списка
-REF_HEADING_PREFIX_RE = re.compile(
-    r'^\s*(' + _REF_HEADING_CORE + r')\s*[:.]?\s+(.+)$', re.IGNORECASE
-)
-# Заголовки «хвоста» статьи, после которых список литературы заканчивается
+REF_HEADING_RE = re.compile(rf'^\s*({_REF_HEADING_ALT})\s*[:.]?\s*$', re.IGNORECASE)
+REF_HEADING_PREFIX_RE = re.compile(rf'^\s*({_REF_HEADING_ALT})\s*[:.]?\s+(.+)$', re.IGNORECASE)
 BACK_MATTER_RE = re.compile(
     r'^\s*(Acknowledg(?:ement|ment)s?\b|Author\s+contributions?\b|Funding\b|'
     r'Competing\s+interests?\b|Additional\s+information\b|Supplementary\s+information\b|'
@@ -146,30 +192,19 @@ BACK_MATTER_RE = re.compile(
     r'Availability\s+of\s+data\s+and\s+materials\b|Declarations?\b|Received[:.]?\s+\d|'
     r'Presented\s+at\b)', re.IGNORECASE
 )
-# Номерные цитаты в тексте (например 5, 1–3, 11, 13–18)
 _CIT_RUN_RE = re.compile(r'^\d{1,2}(?:\s*[,–—-]\s*\d{1,2})*\s*[,.]?$')
 _REF_LABEL_RE = re.compile(
     r'\b(?:Fig(?:ure)?\.?|Table|Tab\.?|Vol(?:ume)?\.?|No\.?|Section|Chapter|Ch\.?|'
     r'Equation|Eq\.?|Ref\.?|Page|pp\.?|Appendix|Supplementary|Suppl\.?)\s*$'
 )
 TABLE_CAPTION_RE = re.compile(r'^\s*(?:Table|Таблица|Табл\.?)\s+\d+', re.I)
-TABLE_CAPTION_STRICT_RE = re.compile(
-    r'^\s*(?:Table|Таблица|Табл\.?)\s+\d+\s*[|:.–—-]', re.I)
+TABLE_CAPTION_STRICT_RE = re.compile(r'^\s*(?:Table|Таблица|Табл\.?)\s+\d+\s*[|:.–—-]', re.I)
 CAPTION_RE = re.compile(r'Figure|Fig\.|Рис\.|Схема|Table|Таблица', re.I)
-FIGURE_CAPTION_RE = re.compile(
-    r'^\s*(?:Fig(?:ure)?\.?\s*\d+|Рис\.?\s*\d+|Схема\s*\d+)', re.I
-)
-FIGURE_CAPTION_STRICT_RE = re.compile(
-    r'^\s*(?:Fig(?:ure)?\.?\s*\d+|Рис\.?\s*\d+|Схема\s*\d+)\s*[|:.,–—-]', re.I
-)
-# Максимальная дистанция между фигурой/рисунком и её подписью
+FIGURE_CAPTION_RE = re.compile(r'^\s*(?:Fig(?:ure)?\.?\s*\d+|Рис\.?\s*\d+|Схема\s*\d+)', re.I)
+FIGURE_CAPTION_STRICT_RE = re.compile(r'^\s*(?:Fig(?:ure)?\.?\s*\d+|Рис\.?\s*\d+|Схема\s*\d+)\s*[|:.,–—-]', re.I)
 CAPTION_DIST_THRESHOLD = 120.0
 LIST_LINE_RE = re.compile(r'^[\s]*([•\-\*►▸‣⁃◦○●▪]|\d+[\.\)]\s|[a-z]\.\s)', re.MULTILINE)
 
-
-# =========================================================
-# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
-# =========================================================
 def _format_time(seconds: float) -> str:
     if seconds < 60:
         return f"{seconds:.0f}с"
@@ -182,21 +217,19 @@ def _format_time(seconds: float) -> str:
         m = int((seconds % 3600) // 60)
         return f"{h}ч {m:02d}м"
 
-
 def normalize_text(text: str) -> str:
     if not text:
         return ""
     text = RE_HYPHEN_BREAK.sub(r'\1\2', text)
+    text = re.sub(r'(?<=\w)-\s+(?=[a-zа-яё])', '-', text)
     text = RE_WHITESPACE.sub(' ', text)
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = re.sub(r'(?<!\n)\n(?!\n)', ' ', text)
     text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
 
-
 def _count_list_lines(text: str) -> int:
     return len(LIST_LINE_RE.findall(text))
-
 
 def _chunk_text_by_sentences(text: str, max_chunk_size: int = 6000) -> List[str]:
     sentences = re.split(r'(?<=[.!?])\s+', text)
@@ -216,37 +249,13 @@ def _chunk_text_by_sentences(text: str, max_chunk_size: int = 6000) -> List[str]
         chunks.append(" ".join(current))
     return chunks if chunks else [text]
 
-
-def _backoff(attempt: int, base: float = 3.0, max_delay: float = 30.0) -> None:
-    if attempt == 0:
-        return
-    delay = min(base * (2 ** (attempt - 1)) + random.uniform(0, 1), max_delay)
-    _interruptible_sleep(delay)
-
-
 def _interruptible_sleep(delay: float, step: float = 0.5) -> None:
-    """sleep, прерываемый по STOP_EVENT (чтобы Ctrl+C/клавиша останавливали ожидание)."""
     remaining = delay
     while remaining > 0 and not STOP_EVENT.is_set():
         time.sleep(min(step, remaining))
         remaining -= step
 
-
-class _DaemonThreadPool(ThreadPoolExecutor):
-    """ThreadPoolExecutor для воркеров перевода.
-
-    Ранее здесь принудительно выставлялся daemon-флаг у уже запущенных
-    потоков, но в Python 3.13 это вызывает RuntimeError
-    ("cannot set daemon status of active thread"), из-за чего executor.submit
-    падал и ни одна задача перевода не выполнялась. Daemon-режим теперь не
-    трогаем; корректное завершение потоков обеспечивается shutdown(wait=False)
-    в finally (см. translate_blocks)."""
-    pass
-
-
 def _start_keyboard_watchdog():
-    """Поток-сторож: на Windows ловит нажатие 'q'/'Q'/Esc/Ctrl-C и ставит STOP_EVENT.
-    Обычный KeyboardInterrupt иногда не доходит до основного потока из-за воркеров."""
     global _watchdog_started
     if _watchdog_started:
         return
@@ -271,16 +280,8 @@ def _start_keyboard_watchdog():
                         time.sleep(0.1)
                 except Exception:
                     break
-
         threading.Thread(target=_watch, daemon=True).start()
-    else:
-        # На POSIX полагаемся на обработчик SIGINT (устанавливает STOP_EVENT).
-        pass
 
-
-# =========================================================
-# МОДЕЛИ ДАННЫХ
-# =========================================================
 @dataclass
 class Span:
     text: str
@@ -291,13 +292,11 @@ class Span:
     origin: tuple
     bbox: tuple
 
-
 @dataclass
 class Line:
     spans: List[Span] = field(default_factory=list)
     bbox: tuple = (0, 0, 0, 0)
     y0: float = 0.0
-
 
 @dataclass
 class Block:
@@ -315,7 +314,6 @@ class Block:
     def text(self) -> str:
         return " ".join(span.text for line in self.lines for span in line.spans).strip()
 
-
 @dataclass
 class Page:
     num: int
@@ -323,17 +321,12 @@ class Page:
     width: float = 0.0
     height: float = 0.0
 
-
-# ---- Фабрики ----
 def make_span(text: str, font: str = "", size: float = 12, flags: int = 0,
               color: int = 0, origin: tuple = (0, 0), bbox: tuple = (0, 0, 0, 0)) -> Span:
     return Span(text=text, font=font, size=size, flags=flags, color=color, origin=origin, bbox=bbox)
 
-
-def make_line(spans: Optional[List[Span]] = None, bbox: tuple = (0, 0, 0, 0),
-              y0: float = 0.0) -> Line:
+def make_line(spans: Optional[List[Span]] = None, bbox: tuple = (0, 0, 0, 0), y0: float = 0.0) -> Line:
     return Line(spans=spans or [], bbox=bbox, y0=y0)
-
 
 def make_block(type: str, lines: Optional[List[Line]] = None, bbox: tuple = (0, 0, 0, 0),
                page_num: int = 0, **kwargs) -> Block:
@@ -342,10 +335,6 @@ def make_block(type: str, lines: Optional[List[Line]] = None, bbox: tuple = (0, 
         setattr(b, k, v)
     return b
 
-
-# =========================================================
-# МЕТРИКИ И КЛАССИФИКАЦИЯ
-# =========================================================
 @dataclass
 class BlockMetrics:
     text: str
@@ -355,7 +344,6 @@ class BlockMetrics:
     is_centered: bool
     total_spans: int
     bbox: tuple
-
 
 def block_metrics(block: Block, page_width: float = 0.0) -> BlockMetrics:
     text = block.text
@@ -375,17 +363,10 @@ def block_metrics(block: Block, page_width: float = 0.0) -> BlockMetrics:
     bbox = block.bbox
     center_x = (bbox[0] + bbox[2]) / 2
     is_centered = abs(center_x - page_width / 2) < page_width * 0.1 if page_width else False
-    return BlockMetrics(
-        text=text, max_font=max_font, all_upper=all_upper,
-        has_bold=has_bold, is_centered=is_centered,
-        total_spans=total_spans, bbox=bbox
-    )
-
+    return BlockMetrics(text=text, max_font=max_font, all_upper=all_upper, has_bold=has_bold, is_centered=is_centered, total_spans=total_spans, bbox=bbox)
 
 class BlockClassifier:
     LABELS = ["paragraph", "heading", "list", "metadata", "reference", "reference_heading", "empty"]
-    # Блоки длиннее этого считаются содержательными и переводятся,
-    # даже если поверхностно похожи на метаданные/референсы.
     METADATA_WORD_LIMIT = 8
 
     def classify(self, block: Block, page_width: float, avg_font_size: float) -> str:
@@ -397,8 +378,11 @@ class BlockClassifier:
         if not re.search(r'[A-Za-zА-Яа-я]', m.text):
             return "empty"
 
-        word_count = len(m.text.split())
+        # Фильтрация технического мусора типа "g()" или строк из одних символов
+        if re.fullmatch(r'\s*(?:[a-zA-Z_]+\(\)|[\W\d]+)\s*', m.text):
+            return "empty"
 
+        word_count = len(m.text.split())
         if REF_HEADING_RE.match(m.text):
             return "reference_heading"
         if _is_table_caption(m.text):
@@ -430,13 +414,8 @@ class BlockClassifier:
             score += 2
         return "heading" if score >= 5 else "paragraph"
 
-
 _classifier = BlockClassifier()
 
-
-# =========================================================
-# ИЗВЛЕЧЕНИЕ PDF
-# =========================================================
 class PDFExtractor:
     def __init__(self, path: str, crop_top: float = 40.0, crop_bottom: float = 45.0):
         self.doc = fitz.open(path)
@@ -474,8 +453,7 @@ class PDFExtractor:
                             block.lines.append(line)
                         if block.lines:
                             page_blocks.append(block)
-                    pages.append(Page(num=page_num + 1, blocks=page_blocks,
-                                      width=page_data.width, height=page_data.height))
+                    pages.append(Page(num=page_num + 1, blocks=page_blocks, width=page_data.width, height=page_data.height))
                 return pages
             except Exception as e:
                 logger.warning(f"pymupdf_layout error: {e}, falling back to standard")
@@ -488,7 +466,7 @@ class PDFExtractor:
             page_blocks = []
             for b in raw.get("blocks", []):
                 if b.get("type") == 0:
-                    block = make_block(type="text", page_num=page_num + 1, bbox=b.get("bbox", (0, 0, 0, 0)))
+                    block = make_block(type="text", page_num=page_num + 1, bbox=b.get("bbox", (0, 0,0,0)))
                     for line_dict in b.get("lines", []):
                         bbox = line_dict.get("bbox", (0, 0, 0, 0))
                         line = make_line(bbox=bbox, y0=bbox[1])
@@ -496,23 +474,14 @@ class PDFExtractor:
                             text = span_dict.get("text", "")
                             if not text.strip():
                                 continue
-                            span = make_span(
-                                text=text, font=span_dict.get("font", ""),
-                                size=span_dict.get("size", 12),
-                                flags=span_dict.get("flags", 0),
-                                color=span_dict.get("color", 0),
-                                origin=span_dict.get("origin", (0, 0)),
-                                bbox=span_dict.get("bbox", (0, 0, 0, 0))
-                            )
+                            span = make_span(text=text, font=span_dict.get("font", ""), size=span_dict.get("size", 12), flags=span_dict.get("flags", 0), color=span_dict.get("color", 0), origin=span_dict.get("origin", (0, 0)), bbox=span_dict.get("bbox", (0, 0, 0, 0)))
                             line.spans.append(span)
                         if line.spans:
                             block.lines.append(line)
                     if block.lines:
                         page_blocks.append(block)
-            pages.append(Page(num=page_num + 1, blocks=page_blocks,
-                              width=raw.get("width", 612), height=raw.get("height", 792)))
+            pages.append(Page(num=page_num + 1, blocks=page_blocks, width=raw.get("width", 612), height=raw.get("height", 792)))
         return pages
-
 
 def extract_tables(page: fitz.Page, page_num: int) -> List[Block]:
     tables = page.find_tables()
@@ -523,28 +492,25 @@ def extract_tables(page: fitz.Page, page_num: int) -> List[Block]:
             if not rows:
                 continue
             cleaned = [[cell if cell else "" for cell in row] for row in rows]
-            block = make_block(type="table", page_num=page_num, bbox=tuple(tab.bbox),
-                               table_data=cleaned)
+            block = make_block(type="table", page_num=page_num, bbox=tuple(tab.bbox), table_data=cleaned)
             table_blocks.append(block)
         except Exception:
             continue
     return table_blocks
 
-
 def _row_columns(block: Block, tol: float = 8.0) -> Optional[List[float]]:
-    """Колонки строки таблицы по x0 строк/спанов (ячейки = отдельные строки/спаны)."""
     if not block.lines:
         return None
     if len(block.lines) == 1:
         xs = [s.bbox[0] for s in block.lines[0].spans if s.text.strip()]
-        if len(xs) < 3:
+        if len(xs) < 2:
             return None
         gaps = [b - a for a, b in zip(sorted(xs), sorted(xs)[1:])]
         if gaps and min(gaps) < 5:
             return None
     else:
         xs = [ln.bbox[0] for ln in block.lines if ln.spans]
-        if len(xs) < 3:
+        if len(xs) < 2:
             return None
     clusters = []
     for x in sorted(xs):
@@ -552,13 +518,11 @@ def _row_columns(block: Block, tol: float = 8.0) -> Optional[List[float]]:
             clusters[-1].append(x)
         else:
             clusters.append([x])
-    if len(clusters) < 3:
+    if len(clusters) < 2:
         return None
     return [sum(c) / len(c) for c in clusters]
 
-
-def _columns_align(ref: List[float], cols: List[float],
-                   tol: float = 10.0, min_frac: float = 0.5) -> bool:
+def _columns_align(ref: List[float], cols: List[float], tol: float = 10.0, min_frac: float = 0.5) -> bool:
     if not ref or not cols:
         return False
     matched = 0
@@ -567,10 +531,8 @@ def _columns_align(ref: List[float], cols: List[float],
             matched += 1
     return matched / len(cols) >= min_frac
 
-
 def _build_table_row(block: Block, columns: List[float]) -> List[str]:
     cells = [""] * len(columns)
-
     def _cell_text(u) -> str:
         if isinstance(u, Span):
             return u.text.strip()
@@ -593,7 +555,6 @@ def _build_table_row(block: Block, columns: List[float]) -> List[str]:
             cells[k] = text
     return cells
 
-
 def _merge_span_table(caption: Block, row_blocks: List[Block]) -> Block:
     columns = []
     for rb in row_blocks:
@@ -608,16 +569,12 @@ def _merge_span_table(caption: Block, row_blocks: List[Block]) -> Block:
     xe = [caption.bbox[2], *[rb.bbox[2] for rb in row_blocks]]
     ye = [caption.bbox[3], *[rb.bbox[3] for rb in row_blocks]]
     bbox = (min(xs), min(ys), max(xe), max(ye))
-    block = make_block(type="table", page_num=caption.page_num, bbox=bbox,
-                       lines=list(caption.lines), caption=caption.text, table_data=data)
+    block = make_block(type="table", page_num=caption.page_num, bbox=bbox, lines=list(caption.lines), caption=caption.text, table_data=data)
     for rb in row_blocks:
         block.lines.extend(rb.lines)
     return block
 
-
 def _find_span_table_blocks(blocks: List[Block]) -> Tuple[List[Block], List[Block]]:
-    """Текстовые таблицы: подпись «Table N» + следующие выровненные по колонкам строки.
-    Возвращает (merged_table_blocks, new_blocks), где подпись заменена на блок таблицы."""
     table_blocks = []
     merged_list = []
     i = 0
@@ -651,7 +608,6 @@ def _find_span_table_blocks(blocks: List[Block]) -> Tuple[List[Block], List[Bloc
         i += 1
     return table_blocks, merged_list
 
-
 def intersection_ratio(block_bbox, table_bbox):
     x0 = max(block_bbox[0], table_bbox[0])
     y0 = max(block_bbox[1], table_bbox[1])
@@ -665,26 +621,15 @@ def intersection_ratio(block_bbox, table_bbox):
         return 0.0
     return intersection / block_area
 
-
-def mark_table_blocks(text_blocks: List[Block], table_blocks: List[Block]):
-    for block in text_blocks:
-        if block.type == "table":
-            continue
-        for table in table_blocks:
-            if intersection_ratio(block.bbox, table.bbox) > 0.30:
-                block.type = "table"
-                break
-
-
+# ИСПРАВЛЕНИЕ 2: Улучшенная детекция таблиц (снижены пороги)
 def _heuristic_table_data(text: str) -> Optional[List[List[str]]]:
-    """Пытается распознать таблицу по структуре текста, когда find_tables() не сработал."""
     lines = [ln for ln in text.split('\n') if ln.strip()]
-    if len(lines) < 3:
+    if len(lines) < 2:
         return None
     rows = []
     for ln in lines:
         cells = [c.strip() for c in re.split(r'\s{2,}|\t', ln) if c.strip()]
-        if len(cells) < 3:
+        if len(cells) < 2:
             return None
         rows.append(cells)
     col_counts = {len(r) for r in rows}
@@ -692,23 +637,9 @@ def _heuristic_table_data(text: str) -> Optional[List[List[str]]]:
         return None
     return rows
 
-
-def heuristic_table_blocks(blocks: List[Block]) -> List[Block]:
-    converted = []
-    for b in blocks:
-        if b.type == "table" or b.type == "figure":
-            continue
-        rows = _heuristic_table_data(b.text)
-        if rows:
-            b.type = "table"
-            b.table_data = rows
-            converted.append(b)
-    return converted
-
-
 def _looks_like_table_data(text: str) -> bool:
     lines = [ln for ln in text.split('\n') if ln.strip()]
-    if len(lines) < 3:
+    if len(lines) < 2:
         return False
     if any(re.search(r'[.!?]\s*$', ln) for ln in lines):
         return False
@@ -719,10 +650,22 @@ def _looks_like_table_data(text: str) -> bool:
         return True
     return False
 
-
-def mark_table_regions(blocks: List[Block]) -> int:
-    """Помечает как таблицы блоки «Table N. ...» и следующие за ними ячейки."""
-    marked = 0
+def consolidate_tables(blocks: List[Block], found_table_blocks: Optional[List[Block]] = None) -> List[Block]:
+    if found_table_blocks:
+        for block in blocks:
+            if block.type == "table":
+                continue
+            for table in found_table_blocks:
+                if intersection_ratio(block.bbox, table.bbox) > 0.30:
+                    block.type = "table"
+                    break
+    for b in blocks:
+        if b.type in ("table", "figure"):
+            continue
+        rows = _heuristic_table_data(b.text)
+        if rows:
+            b.type = "table"
+            b.table_data = rows
     i = 0
     n = len(blocks)
     while i < n:
@@ -741,12 +684,10 @@ def mark_table_regions(blocks: List[Block]) -> int:
         if nb is not None and nb.type == "table" and nb.table_data:
             nb.caption = b.text
             blocks[i] = None
-            marked += 1
             i = j
             continue
         if b.type != "table":
             b.type = "table"
-            marked += 1
         rows = []
         ref = None
         j = i + 1
@@ -759,12 +700,10 @@ def mark_table_regions(blocks: List[Block]) -> int:
                 if ref is None:
                     ref = cols
                 rows.append(nb)
-                marked += 1
                 j += 1
                 continue
             if _heuristic_table_data(nb.text) is not None or _looks_like_table_data(nb.text):
                 rows.append(nb)
-                marked += 1
                 j += 1
             else:
                 break
@@ -775,11 +714,9 @@ def mark_table_regions(blocks: List[Block]) -> int:
             b.caption = merged.caption
             b.table_data = merged.table_data
         i = j
-    return marked
-
+    return [b for b in blocks if b is not None and b.type != "empty" and not (b.type == "table" and b.table_data is None and not b.text.strip())]
 
 def _is_table_caption(text: str) -> bool:
-    """Подпись таблицы: «Table N | ...» (или короткий заголовок без разделителя)."""
     if not text:
         return False
     if TABLE_CAPTION_STRICT_RE.match(text):
@@ -788,9 +725,7 @@ def _is_table_caption(text: str) -> bool:
         return False
     return len(text) <= 120 and len(text.split()) <= 15
 
-
 def _is_figure_caption(text: str) -> bool:
-    """Подпись рисунка: «Fig. N | ...», «Figure 3. ...» (якорно, не просто упоминание)."""
     if not text:
         return False
     if not FIGURE_CAPTION_RE.match(text):
@@ -802,22 +737,17 @@ def _is_figure_caption(text: str) -> bool:
         return False
     if len(text) > 160:
         return False
-    if re.search(r'\b(?:illustrates?|shows?|depicts?|displays?|demonstrates?|presents?|'
-                 r'изобража\w*|показыва\w*|иллюстрир\w*)\b', text, re.I):
+    if re.search(r'\b(?:illustrates?|shows?|depicts?|displays?|demonstrates?|presents?|изобража\w*|показыва\w*|иллюстрир\w*)\b', text, re.I):
         return False
     return True
-
 
 def _rect_gap(a, b) -> float:
     dx = max(0.0, max(a[0], b[0]) - min(a[2], b[2]))
     dy = max(0.0, max(a[1], b[1]) - min(a[3], b[3]))
     return max(dx, dy)
 
-
 def _union_rects(rects) -> fitz.Rect:
-    return fitz.Rect(min(r.x0 for r in rects), min(r.y0 for r in rects),
-                     max(r.x1 for r in rects), max(r.y1 for r in rects))
-
+    return fitz.Rect(min(r.x0 for r in rects), min(r.y0 for r in rects), max(r.x1 for r in rects), max(r.y1 for r in rects))
 
 def _cluster_drawing_rects(rects: List[fitz.Rect], gap: float = 6.0) -> List[List[fitz.Rect]]:
     clusters = []
@@ -832,7 +762,6 @@ def _cluster_drawing_rects(rects: List[fitz.Rect], gap: float = 6.0) -> List[Lis
             clusters.append([r])
     return clusters
 
-
 def _overlaps_any(rect: fitz.Rect, others, ratio: float = 0.4) -> bool:
     a = rect.get_area() or 1.0
     for o in others:
@@ -841,6 +770,19 @@ def _overlaps_any(rect: fitz.Rect, others, ratio: float = 0.4) -> bool:
             return True
     return False
 
+def _nearest_caption(rect, candidates, caption_ids) -> Tuple[Optional[str], int]:
+    best_dist = CAPTION_DIST_THRESHOLD
+    caption = None
+    cap_idx = -1
+    for idx, block in candidates:
+        if idx in caption_ids:
+            continue
+        d = _rect_gap(rect, block.bbox)
+        if d < best_dist:
+            best_dist = d
+            caption = block.text
+            cap_idx = idx
+    return caption, cap_idx
 
 def extract_images(page: fitz.Page, page_num: int, text_blocks: List[Block]) -> Tuple[List[Block], List[Block]]:
     image_list = page.get_images(full=True)
@@ -865,30 +807,15 @@ def extract_images(page: fitz.Page, page_num: int, text_blocks: List[Block]) -> 
         if img_bbox.get_area() < 300:
             continue
         image_data = base64.b64encode(data).decode()
-        caption = None
-        cap_idx = -1
-        best_dist = CAPTION_DIST_THRESHOLD
-        for idx, block in candidates:
-            if idx in caption_ids:
-                continue
-            d = _rect_gap(img_bbox, block.bbox)
-            if d < best_dist:
-                best_dist = d
-                caption = block.text
-                cap_idx = idx
+        caption, cap_idx = _nearest_caption(img_bbox, candidates, caption_ids)
         if cap_idx >= 0:
             caption_ids.add(cap_idx)
-        fig_block = make_block(type="figure", page_num=page_num, bbox=tuple(img_bbox),
-                               image_data=image_data, image_ext=ext, caption=caption)
+        fig_block = make_block(type="figure", page_num=page_num, bbox=tuple(img_bbox), image_data=image_data, image_ext=ext, caption=caption)
         figure_blocks.append(fig_block)
     remaining = [b for i, b in enumerate(text_blocks) if i not in caption_ids]
     return figure_blocks, remaining
 
-
-def extract_vector_figures(page: fitz.Page, page_num: int, text_blocks: List[Block],
-                           used_bboxes=(), table_bboxes=(), dpi: int = 150) -> Tuple[List[Block], List[Block]]:
-    """Извлекает векторные фигуры (drawings): кластеризует области отрисовки,
-    исключает таблицы/растровые изображения и рендерит регион как PNG."""
+def extract_vector_figures(page: fitz.Page, page_num: int, text_blocks: List[Block], used_bboxes=(), table_bboxes=(), dpi: int = 150) -> Tuple[List[Block], List[Block]]:
     draw_rects = []
     for d in page.get_drawings():
         r = fitz.Rect(d["rect"])
@@ -914,47 +841,27 @@ def extract_vector_figures(page: fitz.Page, page_num: int, text_blocks: List[Blo
             continue
         if _overlaps_any(rect, table_rects, 0.4) or _overlaps_any(rect, used_rects, 0.4):
             continue
-        caption = None
-        cap_idx = -1
-        best_dist = CAPTION_DIST_THRESHOLD
-        for idx, b in candidates:
-            if idx in caption_ids:
-                continue
-            d = _rect_gap(rect, b.bbox)
-            if d < best_dist:
-                best_dist = d
-                caption = b.text
-                cap_idx = idx
+        caption, cap_idx = _nearest_caption(rect, candidates, caption_ids)
         if caption is None:
             continue
         caption_ids.add(cap_idx)
 
-        # ---------- ИСПРАВЛЕНИЕ: двойная попытка рендеринга с csRGB и без ----------
         image_data = None
         try:
-            # Первая попытка с явным csRGB (исправляет ошибки цветового профиля)
-            pix = page.get_pixmap(matrix=fitz.Matrix(dpi / 72, dpi / 72),
-                                  clip=rect, alpha=False, colorspace=fitz.csRGB)
+            pix = page.get_pixmap(matrix=fitz.Matrix(dpi / 72, dpi / 72), clip=rect, alpha=False, colorspace=fitz.csRGB)
             image_data = base64.b64encode(pix.tobytes("png")).decode()
         except Exception as e1:
             try:
-                # Вторая попытка без указания colorspace
-                pix = page.get_pixmap(matrix=fitz.Matrix(dpi / 72, dpi / 72),
-                                      clip=rect, alpha=False)
+                pix = page.get_pixmap(matrix=fitz.Matrix(dpi / 72, dpi / 72), clip=rect, alpha=False)
                 image_data = base64.b64encode(pix.tobytes("png")).decode()
             except Exception as e2:
                 logger.warning(f"   Рендер векторной фигуры (стр. {page_num}): {e2}")
-                continue  # пропускаем этот кластер
+                continue
 
-        figure_blocks.append(make_block(type="figure", page_num=page_num, bbox=tuple(rect),
-                                        image_data=image_data, image_ext="png", caption=caption))
+        figure_blocks.append(make_block(type="figure", page_num=page_num, bbox=tuple(rect), image_data=image_data, image_ext="png", caption=caption))
     remaining = [b for i, b in enumerate(text_blocks) if i not in caption_ids]
     return figure_blocks, remaining
 
-
-# =========================================================
-# RATE LIMITER
-# =========================================================
 class RateLimiter:
     def __init__(self, max_requests_per_second: float = 5.0):
         self.rate = max_requests_per_second
@@ -970,7 +877,6 @@ class RateLimiter:
         if sleep_time > 0:
             time.sleep(sleep_time)
 
-
 def _make_session(max_workers: int = 8) -> requests.Session:
     s = requests.Session()
     adapter = HTTPAdapter(pool_connections=max_workers, pool_maxsize=max_workers * 2)
@@ -978,143 +884,245 @@ def _make_session(max_workers: int = 8) -> requests.Session:
     s.mount('http://', adapter)
     return s
 
-
-# =========================================================
-# ПРОМПТЫ И ГЛОССАРИЙ
-# =========================================================
 SYSTEM_TRANSLATE_PROMPT = (
-    "Ты — эксперт-переводчик научных статей. Переведи текст на {lang}. "
-    "Сохраняй академический стиль, точность терминов и структуру Markdown. "
-    "Не переводи имена собственные, формулы, числовые данные и аббревиатуры. "
-    "Ссылки на литературу вида [[REFn]] копируй в перевод в том же виде, не меняя и не удаляя их. "
-    "Верни ТОЛЬКО перевод, без пояснений."
-)
-
-GLOSSARY_PROMPT = (
-    "Извлеки до 20 ключевых научных терминов из текста и дай их перевод на {lang}. "
-    "Верни строго в формате JSON-объекта: {{'термин': 'перевод', ...}}. Только JSON, без пояснений."
+    "You are a professional scientific translator. "
+    "Translate ONLY the TARGET text from {source_lang} into {lang}. "
+    "Do not summarize, explain, comment, or add information. "
+    "Do not reproduce the source text. "
+    "Do not create headings, labels, quotes, Markdown fences, or alternative translations. "
+    "Preserve paragraph boundaries. "
+    "Preserve every protected token exactly as written. "
+    "Return ONLY the translation of TARGET."
 )
 
 TABLE_TRANSLATE_PROMPT = (
-    "Переведи содержимое ячеек таблицы на {lang}. Сохрани структуру таблицы: те же строки, "
-    "колонки и разделители (| и ---). Не переводи числа, единицы измерения и аббревиатуры. "
-    "Верни ТОЛЬКО таблицу, без пояснений."
+    "Translate ONLY the text inside table cells into {lang}. "
+    "Preserve the exact number of rows and columns. "
+    "Preserve numbers, units, abbreviations and protected tokens. "
+    "Return ONLY the table."
 )
 
-REFINE_PROMPT = (
-    "Проверь перевод научного текста на {lang} на пропуски, галлюцинации и смысловые ошибки. "
-    "Если есть ошибки — исправь их, вернув исправленный перевод. Если ошибок нет — верни исходный перевод. "
-    "Ссылки на литературу вида [[REFn]] копируй без изменений. "
-    "Верни ТОЛЬКО исправленный текст, без пояснений."
-)
+_CYRILLIC_LANGS = {"ru", "uk", "bg", "sr", "be", "mk", "kk", "uz", "ky", "mn"}
+_CYRILLIC_RE = re.compile(r'[а-яё]', re.I)
+_LANG_NAMES = {
+    "ru": "Russian", "en": "English", "de": "German", "fr": "French",
+    "es": "Spanish", "it": "Italian", "zh": "Chinese", "ja": "Japanese",
+    "ko": "Korean", "pt": "Portuguese", "pl": "Polish", "tr": "Turkish",
+    "ar": "Arabic", "hi": "Hindi", "uk": "Ukrainian", "bg": "Bulgarian",
+}
 
-
-def extract_glossary(text: str, translator, lang: str,
-                     cache: "Optional[TranslationCache]" = None) -> Dict[str, str]:
-    if not text or not getattr(translator, 'can_generate', False):
-        return {}
-    cache_key = f"glossary:{lang}"
-    if cache is not None:
-        cached = cache.get(text, cache_key)
-        if cached:
-            try:
-                return json.loads(cached)
-            except Exception:
-                pass
-    prompt = GLOSSARY_PROMPT.format(lang=lang) + "\n\n" + text[:20000]
-    try:
-        raw = translator.generate(prompt)
-    except Exception:
-        raw = None
-    glossary = {}
-    if raw:
-        m = re.search(r'\{.*\}', raw, re.DOTALL)
-        if m:
-            try:
-                parsed = json.loads(m.group(0))
-                if isinstance(parsed, dict):
-                    glossary = {str(k).strip(): str(v).strip() for k, v in parsed.items()}
-            except Exception:
-                logger.warning("   Глоссарий: не удалось распарсить JSON")
-        if glossary and cache is not None:
-            cache.put(text, cache_key, json.dumps(glossary, ensure_ascii=False))
-    return glossary
-
-
-def _system_prompt(lang: str, glossary: Optional[Dict[str, str]] = None) -> str:
-    prompt = SYSTEM_TRANSLATE_PROMPT.format(lang=lang)
+def _translation_system_prompt(source_lang: str, lang: str, glossary: Optional[Dict[str, str]] = None) -> str:
+    prompt = SYSTEM_TRANSLATE_PROMPT.format(source_lang=source_lang or "the source language", lang=_LANG_NAMES.get(lang, lang))
     if glossary:
-        terms = "\n".join(f"  {k} -> {v}" for k, v in glossary.items())
-        prompt += f"\n\nГлоссарий терминов (используй эти переводы):\n{terms}"
+        terms = "\n".join(f"- {k} => {v}" for k, v in glossary.items())
+        prompt += "\n\nTerminology memory. Use these translations when the corresponding source term occurs. Do not output this list:\n" + terms
     return prompt
 
+def _strip_llm_wrappers(text: Optional[str]) -> str:
+    if not text:
+        return ""
+    text = text.strip()
+    text = re.sub(r"^\s*```(?:text|markdown)?\s*", "", text, flags=re.I)
+    text = re.sub(r"\s*```\s*$", "", text, flags=re.I)
+    marker_line = re.compile(r"^\s*<<<\s*(?:END_)?[A-Z_][A-Z0-9_]*\s*>>>\s*$", re.I)
+    lines = text.splitlines()
+    while lines and marker_line.match(lines[0]):
+        lines.pop(0)
+    while lines and marker_line.match(lines[-1]):
+        lines.pop()
+    text = "\n".join(lines).strip()
+    text = re.sub(r"<<<\s*(?:END_)?[A-Z_][A-Z0-9_]*\s*>>>", "", text, flags=re.I)
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
 
-# =========================================================
-# ЗАЩИТА ССЫЛОК НА ЛИТЕРАТУРУ
-# =========================================================
+    lines = text.splitlines()
+    if lines:
+        first = lines[0].strip().lower()
+        preambles = ("translation:", "translated text:", "here is the translation:", "here's the translation:", "перевод:", "вот перевод:")
+        if first in preambles:
+            lines = lines[1:]
+    return "\n".join(lines).strip()
+
+def _norm_for_compare(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").strip()).casefold()
+
+def _extract_numbers(text: str) -> list:
+    pattern = re.compile(r"(?<!\w)[+-]?(?:\d+(?:[.,]\d+)?(?:[eE][+-]?\d+)?|\.\d+)(?:\s*[%‰])?(?!\w)")
+    return pattern.findall(text or "")
+
+# ИСПРАВЛЕНИЕ 1: Защита академических цитат и HTML-ссылок целиком
+def _extract_protected_tokens(text: str) -> Tuple[str, Dict[str, str]]:
+    protected: Dict[str, str] = {}
+    counter = 0
+
+    def add_value(value: str, prefix: str = "P") -> str:
+        nonlocal counter
+        if not value or not value.strip():
+            return value
+        key = f"[[{prefix}_{counter:04d}]]"
+        counter += 1
+        protected[key] = value
+        return f" {key} "
+
+    result = text
+
+    # Защита HTML ссылок <a href="...">...</a>
+    html_link_pattern = re.compile(r"<a\s+[^>]*href=['\"][^'\"]+['\"][^>]*>.*?</a>", re.I | re.DOTALL)
+    for m in html_link_pattern.finditer(result):
+        value = m.group(0).strip()
+        result = result[:m.start()] + add_value(value, "LINK") + result[m.end():]
+
+    # Защита атрибутов href="..."
+    href_pattern = re.compile(r"href=['\"][^'\"]+['\"]", re.I)
+    for m in href_pattern.finditer(result):
+        value = m.group(0).strip()
+        result = result[:m.start()] + add_value(value, "LINK") + result[m.end():]
+
+    # Защита всей академической цитаты (Smith et al., 2015) -> [[CITE_0001]]
+    surname = r"[A-ZÀ-ÖØ-Þ][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+"
+    citation_pattern = re.compile(
+        rf"\([^\n(){{}}]{{0,220}}(?:19|20)\d{{2}}[^\n(){{}}]{{0,40}}\)"
+        rf"|\b{surname}(?:\s+et\s+al\.?)?\s*\((?:19|20)\d{{2}}[^)]*\)",
+        re.UNICODE | re.I,
+    )
+    spans = []
+    for cm in citation_pattern.finditer(result):
+        value = cm.group(0).strip()
+        spans.append((cm.start(), cm.end(), value))
+    for a, b, value in sorted(set(spans), reverse=True):
+        result = result[:a] + add_value(value, "CITE") + result[b:]
+
+    patterns = [
+        re.compile(r"\[\[REF\d+\]\]"),
+        REF_PATTERN,
+        re.compile(r"https?://[^\s<>\]\)]+", re.I),
+        re.compile(r"\b(?:doi:\s*)?10\.\d{4,9}/[-._;()/:A-Z0-9]+\b", re.I),
+        re.compile(r"\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b"),
+        re.compile(r"(?<!\w)[A-Za-z][A-Za-z0-9_]*(?:\s*[=<>≤≥±]\s*[^,.;\n]+)?"),
+    ]
+
+    def add(match):
+        value = match.group(0)
+        if not value.strip():
+            return value
+        if re.fullmatch(r"[A-Za-z]{1,20}", value):
+            return value
+        return add_value(value)
+
+    for pat in patterns:
+        result = pat.sub(add, result)
+    return result, protected
+
+def _restore_protected(text: str, protected: Dict[str, str]) -> str:
+    result = text or ""
+    for token, original in protected.items():
+        pattern = re.escape(token).replace(r"\[\[", r"\[\[\s*").replace(r"\]\]", r"\s*\]\]")
+        result = re.sub(pattern, lambda m: original, result, flags=re.I | re.DOTALL)
+    result = re.sub(r"\[\[\s*(?:AUTHOR|P|REF|CITE|LINK)_\d+\s*\]\]", "", result, flags=re.I | re.DOTALL)
+    return result
+
+def _repetition_ratio(text: str, n: int = 6) -> float:
+    words = re.findall(r"\w+", (text or "").casefold(), flags=re.UNICODE)
+    if len(words) < n * 2:
+        return 0.0
+    grams = [" ".join(words[i:i+n]) for i in range(len(words)-n+1)]
+    counts = {}
+    for g in grams:
+        counts[g] = counts.get(g, 0) + 1
+    repeated = sum(c - 1 for c in counts.values() if c > 1)
+    return repeated / max(1, len(grams))
+
+def _looks_like_meta_response(text: str) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return False
+    lines = [x.strip().casefold() for x in t.splitlines() if x.strip()]
+    if not lines:
+        return False
+    bad_prefixes = ("analysis:", "reasoning:", "chain of thought:", "thoughts:", "translation note:", "translator note:", "here is the translation:", "вот перевод:", "анализ:", "рассуждение:", "объяснение:", "я не могу перевести", "не могу перевести")
+    if any(line.startswith(bad_prefixes) for line in lines[:2]):
+        return True
+    meta = re.search(r"\b(i cannot|i can't|i am unable|as an ai|as a language model)\b", t, re.I)
+    return bool(meta)
+
+def validate_translation(source: str, candidate: str, target_lang: str, protected: Optional[Dict[str, str]] = None) -> Tuple[bool, Dict[str, Any]]:
+    source = (source or "").strip()
+    candidate = _strip_llm_wrappers(candidate)
+    info: Dict[str, Any] = {"echo": False, "too_short": False, "too_long": False, "repetition": False, "numbers_changed": False, "protected_missing": [], "language_mismatch": False, "meta_response": False}
+    if not candidate:
+        return False, info
+    info["meta_response"] = _looks_like_meta_response(candidate)
+
+    src_norm = _norm_for_compare(source)
+    cand_norm = _norm_for_compare(candidate)
+
+    if len(source) >= 20:
+        if cand_norm == src_norm:
+            info["echo"] = True
+        elif src_norm in cand_norm and len(src_norm) > 100 and len(src_norm) > len(cand_norm) * 0.8:
+            info["echo"] = True
+
+    if len(source) >= 150 and len(candidate) < max(30, int(len(source) * 0.15)):
+        info["too_short"] = True
+    if len(source) >= 100 and len(candidate) > int(len(source) * 3.2):
+        info["too_long"] = True
+
+    if _repetition_ratio(candidate) > 0.30:
+        info["repetition"] = True
+
+    def _norm_num(x: str):
+        x = x.strip().replace(" ", "").replace("−", "-")
+        x = re.sub(r"[%‰]$", "", x)
+        try:
+            return ("num", float(x.replace(",", ".")))
+        except ValueError:
+            try:
+                return ("num", float(x.replace(",", "")))
+            except ValueError:
+                return ("txt", x.casefold())
+
+    src_nums = sorted(_norm_num(x) for x in _extract_numbers(source))
+    cand_nums = sorted(_norm_num(x) for x in _extract_numbers(candidate))
+    if src_nums != cand_nums:
+        info["numbers_changed"] = True
+
+    if protected:
+        info["protected_missing"] = [token for token in protected if token not in candidate]
+
+    if target_lang in _CYRILLIC_LANGS and len(candidate) > 30:
+        letters = [c for c in candidate if c.isalpha()]
+        cyr = sum(1 for c in letters if _CYRILLIC_RE.match(c))
+        if letters and cyr / len(letters) < 0.12:
+            info["language_mismatch"] = True
+
+    hard = bool(info["echo"] or info["too_short"] or info["too_long"] or info["meta_response"] or not candidate)
+    return (not hard), info
+
 REF_PATTERN = re.compile(r'\[(?:[0-9][0-9,\s;\-–—]*|[A-Za-z][A-Za-z0-9-]*)\]')
-# Любой плейсхолдер ссылки, который может выдать модель: [[REF0]], [[REFn]],
-# [[ REFn ]] и т.п. translategemma нормализует цитаты именно в такой вид.
-_REF_TOKEN_RE = re.compile(r'\[\[\s*REF[^\]]*\]\]')
-# Для защиты захватываем не только [1], [Chouchou2014], но и автор-годные
-# цитаты в скобках (Smith et al., 2014), которые REF_PATTERN (только [...]).
-# не ловит, но модель всё равно нормализует в [[REFn]] и ломает ссылки.
-_REF_PAREN_RE = re.compile(
-    r'\(\s*[A-Za-z][^()]{0,60}?\b(?:19|20)\d{2}[a-z]?\s*\)'
-)
-REF_PATTERN_PROTECT = re.compile(REF_PATTERN.pattern + r'|' + _REF_PAREN_RE.pattern)
-
+_REF_PH_RE = re.compile(r'(?<![A-Za-z0-9_])\[?\[?REF_?(\d+)\]?\]?(?![A-Za-z0-9_])')
 
 def protect_refs(text: str) -> Tuple[str, Dict[str, str]]:
     refs: Dict[str, str] = {}
-
     def repl(m) -> str:
         key = f"[[REF{len(refs)}]]"
         refs[key] = m.group(0)
         return f" {key} "
-
-    return REF_PATTERN_PROTECT.sub(repl, text), refs
-
+    return REF_PATTERN.sub(repl, text), refs
 
 def restore_refs(text: str, refs: Dict[str, str]) -> str:
-    """Восстанавливает оригинальные цитаты.
-
-    translategemma (и ряд моделей) нормализует цитаты в единый вид [[REFn]]
-    (буква n вместо номера) либо сохраняет номер [[REF0]]. Поэтому точного
-    совпадения по номеру недостаточно — сопоставляем плейсхолдеры с оригиналами
-    ПО ПОРЯДКУ ПОЯВЛЕНИЯ, что корректно в обоих случаях.
-    """
     if not refs:
         return text
-    origs = list(refs.values())
-    # 1) точные плейсхолдеры с номером [[REF0]] -> оригинал по индексу
-    for i, orig in enumerate(origs):
-        text = text.replace(f"[[REF{i}]]", orig)
-    # 2) порядковое сопоставление оставшихся [[REF...]] токенов
-    remaining = _REF_TOKEN_RE.findall(text)
-    if remaining:
-        unrestored = [o for o in origs if o not in text]
-        for tok in remaining:
-            if not unrestored:
-                break
-            text = text.replace(tok, unrestored.pop(0), 1)
-    # 3) сетка безопасности: любые необратимые [[REF...]] (например,
-    # галлюцинированные моделью) удаляем, чтобы они не попали в итог.
-    text = _REF_TOKEN_RE.sub("", text)
-    return text
-
+    for ph, orig in refs.items():
+        text = text.replace(ph, orig)
+    by_index = {i: orig for i, orig in enumerate(refs.values())}
+    def rep(m) -> str:
+        idx = int(m.group(1))
+        return by_index.get(idx, m.group(0))
+    return _REF_PH_RE.sub(rep, text)
 
 def highlight_refs(escaped_text: str) -> str:
-    return REF_PATTERN.sub(
-        lambda m: f'<span class="ref-link">{m.group(0)}</span>', escaped_text
-    )
+    return REF_PATTERN.sub(lambda m: f'<span class="ref-link">{m.group(0)}</span>', escaped_text)
 
-
-# =========================================================
-# ЦИТАТЫ-НОМЕРА (жирный/надстрочный шрифт) → СКВОЗНЫЕ СКОБКИ []
-# =========================================================
 def _wrap_citation_spans(block: Block) -> None:
-    """Оборачивает в [..] номерные цитаты (1–3, 5, 11, 13–18) в тексте блока."""
     for line in block.lines:
         spans = line.spans
         if not spans:
@@ -1136,11 +1144,7 @@ def _wrap_citation_spans(block: Block) -> None:
                     if not _REF_LABEL_RE.search(prev_text):
                         cit = re.sub(r'\s*,\s*', ', ', re.sub(r'\s*[–—-]\s*', '–', run_text.strip('., ')))
                         cit = cit.rstrip('., ')
-                        new_spans.append(make_span(
-                            text="[" + cit + "]",
-                            font=s.font, size=s.size, flags=s.flags, color=s.color,
-                            origin=s.origin, bbox=s.bbox
-                        ))
+                        new_spans.append(make_span(text="[" + cit + "]", font=s.font, size=s.size, flags=s.flags, color=s.color, origin=s.origin, bbox=s.bbox))
                         i = j
                         continue
                 new_spans.extend(spans[i:j])
@@ -1150,9 +1154,7 @@ def _wrap_citation_spans(block: Block) -> None:
                 i += 1
         line.spans = new_spans
 
-
 def _split_line(line: Line, idx: int) -> Tuple[Line, Line]:
-    """Разделяет строку по позиции idx внутри текста спанов."""
     head_spans: List[Span] = []
     rest_spans: List[Span] = []
     pos = 0
@@ -1164,18 +1166,12 @@ def _split_line(line: Line, idx: int) -> Tuple[Line, Line]:
             rest_spans.append(s)
         else:
             cut = idx - pos
-            head_spans.append(make_span(text=t[:cut], font=s.font, size=s.size,
-                                        flags=s.flags, color=s.color, origin=s.origin, bbox=s.bbox))
-            rest_spans.append(make_span(text=t[cut:], font=s.font, size=s.size,
-                                        flags=s.flags, color=s.color, origin=s.origin, bbox=s.bbox))
+            head_spans.append(make_span(text=t[:cut], font=s.font, size=s.size, flags=s.flags, color=s.color, origin=s.origin, bbox=s.bbox))
+            rest_spans.append(make_span(text=t[cut:], font=s.font, size=s.size, flags=s.flags, color=s.color, origin=s.origin, bbox=s.bbox))
         pos += len(t)
-    return (make_line(spans=head_spans, bbox=line.bbox, y0=line.y0),
-            make_line(spans=rest_spans, bbox=line.bbox, y0=line.y0))
-
+    return (make_line(spans=head_spans, bbox=line.bbox, y0=line.y0), make_line(spans=rest_spans, bbox=line.bbox, y0=line.y0))
 
 def _split_ref_heading(block: Block) -> List[Block]:
-    """Если блок начинается с заголовка списка литературы, разделяет его
-    на блок-заголовок и блок с записями списка."""
     if not block.lines:
         return [block]
     lines = block.lines
@@ -1183,27 +1179,19 @@ def _split_ref_heading(block: Block) -> List[Block]:
     first_text = " ".join(s.text for s in first.spans).strip()
     if REF_HEADING_RE.match(first_text):
         if len(lines) > 1:
-            head_block = make_block(type="reference_heading", page_num=block.page_num,
-                                    bbox=block.bbox, lines=lines[:1])
-            rest_block = make_block(type="reference", page_num=block.page_num,
-                                    bbox=block.bbox, lines=lines[1:])
+            head_block = make_block(type="reference_heading", page_num=block.page_num, bbox=block.bbox, lines=lines[:1])
+            rest_block = make_block(type="reference", page_num=block.page_num, bbox=block.bbox, lines=lines[1:])
             return [head_block, rest_block]
         return [block]
     m = REF_HEADING_PREFIX_RE.match(first_text)
     if m and m.group(2) and len(first_text) > len(m.group(1)):
         idx = first_text.find(m.group(1).strip()) + len(m.group(1).strip())
         head_line, rest_line = _split_line(first, idx)
-        head_block = make_block(type="reference_heading", page_num=block.page_num,
-                                bbox=block.bbox, lines=[head_line])
-        rest_block = make_block(type="reference", page_num=block.page_num,
-                                bbox=block.bbox, lines=[rest_line] + lines[1:])
+        head_block = make_block(type="reference_heading", page_num=block.page_num, bbox=block.bbox, lines=[head_line])
+        rest_block = make_block(type="reference", page_num=block.page_num, bbox=block.bbox, lines=[rest_line] + lines[1:])
         return [head_block, rest_block]
     return [block]
 
-
-# =========================================================
-# ПЕРЕВОДЧИКИ
-# =========================================================
 class GoogleTranslator:
     def __init__(self, target_lang: str):
         self.name = "Google"
@@ -1211,50 +1199,26 @@ class GoogleTranslator:
         self.can_generate = False
         self.session = _make_session()
         self.session.headers.update({"User-Agent": "Mozilla/5.0"})
-        # ИСПРАВЛЕНИЕ: уменьшаем частоту до 1 запроса в секунду (было 3)
         self.rate_limiter = RateLimiter(max_requests_per_second=0.5)
-        # Прогрессивное увеличение задержки при 429 (счётчик между вызовами)
         self._rate_limit_count = 0
         self._429_max_retries = 8
-        # ГЛОБАЛЬНАЯ пауза: все воркер-потоки делят один экземпляр переводчика,
-        # поэтому 429 должен останавливать ВЕСЬ пул, а не только один поток.
-        self._cooldown_lock = threading.Lock()
-        self._cooldown_until = 0.0
-
-    def _wait_before_request(self) -> None:
-        """Блокирует поток до разрешённого момента: учитывает и rate limiter,
-        и глобальную паузу после 429 (чтобы пул не долбил сервер)."""
-        with self._cooldown_lock:
-            wait = max(0.0, self._cooldown_until - time.monotonic())
-        self.rate_limiter.acquire()
-        if wait > 0:
-            _interruptible_sleep(wait)
-
-    def _set_cooldown(self, delay: float) -> None:
-        until = time.monotonic() + delay
-        with self._cooldown_lock:
-            if until > self._cooldown_until:
-                self._cooldown_until = until
 
     def translate(self, text: str, glossary: Optional[Dict[str, str]] = None) -> Optional[str]:
+        self.rate_limiter.acquire()
         attempt = 0
         while True:
-            self._wait_before_request()
             try:
                 resp = self.session.get(
                     "https://translate.googleapis.com/translate_a/single",
-                    params={"client": "gtx", "sl": "auto", "tl": self.target_lang,
-                            "dt": "t", "ie": "UTF-8", "oe": "UTF-8", "q": text},
+                    params={"client": "gtx", "sl": "auto", "tl": self.target_lang, "dt": "t", "ie": "UTF-8", "oe": "UTF-8", "q": text},
                     timeout=120
                 )
                 if resp.status_code == 429:
-                    raise requests.exceptions.HTTPError(
-                        f"429 Client Error", response=resp)
+                    raise requests.exceptions.HTTPError(f"429 Client Error", response=resp)
                 resp.raise_for_status()
                 data = resp.json()
                 parts = [p[0] for p in data[0] if p[0]]
                 result = " ".join(parts).strip()
-                # успешный запрос сбрасывает прогрессивный счётчик задержки
                 self._rate_limit_count = 0
                 return result if result else None
             except requests.exceptions.HTTPError as e:
@@ -1262,19 +1226,11 @@ class GoogleTranslator:
                     attempt += 1
                     self._rate_limit_count += 1
                     retry_after = e.response.headers.get('Retry-After')
-                    if retry_after and str(retry_after).isdigit():
-                        # сервер явно просит подождать
+                    if retry_after and retry_after.isdigit():
                         delay = float(retry_after)
                     else:
-                        # прогрессивное увеличение: 10s, 20s, 40s, 80s ... до 5 минут
-                        delay = min(10.0 * (2 ** (attempt - 1)),
-                                    300.0) + random.uniform(0, 2)
-                    logger.warning(
-                        f"   Google Translate: 429 Too Many Requests, "
-                        f"пауза {delay:.0f} сек (попытка {attempt}/{self._429_max_retries})"
-                    )
-                    # ставим глобальную паузу для ВСЕГО пула воркеров
-                    self._set_cooldown(delay)
+                        delay = min(10.0 * (2 ** (self._rate_limit_count - 1)), 300.0) + random.uniform(0, 2)
+                    logger.warning(f"   Google Translate: 429, пауза {delay:.0f} сек (попытка {attempt}/{self._429_max_retries})")
                     _interruptible_sleep(delay)
                     if STOP_EVENT.is_set() or attempt >= self._429_max_retries:
                         self._rate_limit_count = 0
@@ -1291,26 +1247,26 @@ class GoogleTranslator:
     def generate(self, prompt: str) -> Optional[str]:
         return None
 
-
-class OpenRouterRotator:
-    def __init__(self, target_lang: str):
+class SprutRotator:
+    def __init__(self, target_lang: str, model: Optional[str] = None):
         self.target_lang = target_lang
-        self.name = "OpenRouter"
+        self.name = "SprutDock"
         self.can_generate = True
         self._client = None
         self._models: list = []
         self._current_idx = 0
         self._exhausted_models: dict = {}
-        self._model_cooldown_sec = 60
+        self._model_cooldown_sec = MODEL_COOLDOWN_SEC
+        self._forced_model = model
         self.rate_limiter = RateLimiter(max_requests_per_second=0.3)
-        if OPENAI_API_KEY:
+        if SPRUTDOCK_API_KEY:
             try:
                 from openai import OpenAI
                 self._client = OpenAI(
-                    api_key=OPENAI_API_KEY,
+                    api_key=SPRUTDOCK_API_KEY,
                     base_url=OPENAI_BASE_URL,
                     default_headers={"X-Title": "pdf-translator"},
-                    timeout=120,
+                    timeout=API_TIMEOUT,
                     max_retries=0,
                 )
                 self._discover_free_models()
@@ -1322,16 +1278,26 @@ class OpenRouterRotator:
             return
         try:
             resp = self._client.models.list()
-            self._models = sorted(
-                [m.id for m in resp.data if "free" in m.id.lower()],
-                key=lambda x: ("openrouter/" in x, x), reverse=True,
-            )
-            if not self._models:
-                self._models = ["openrouter/free", "google/gemma-4-31b-it:free"]
-            logger.info(f"OpenRouter: {len(self._models)} free-моделей")
+            available = [m.id for m in resp.data] if resp and resp.data else []
+
+            if self._forced_model:
+                if not available or self._forced_model in available:
+                    self._models = [self._forced_model]
+                    logger.info(f"SprutDock: принудительно используется модель {self._forced_model}")
+                else:
+                    logger.warning(f"SprutDock: запрошенная модель {self._forced_model} недоступна. Доступные: {available}")
+                    self._models = available or [DEFAULT_MODEL]
+            elif DEFAULT_MODEL in available:
+                self._models = [DEFAULT_MODEL]
+            elif available:
+                free = sorted([m for m in available if "free" in m.lower()], key=lambda x: (DEFAULT_MODEL.split("/")[0] in x, x), reverse=True)
+                self._models = free or [DEFAULT_MODEL]
+            else:
+                self._models = [DEFAULT_MODEL]
+            logger.info(f"SprutDock: доступно моделей: {len(self._models)}")
         except Exception as e:
-            logger.warning(f"OpenRouter: не удалось получить модели: {e}")
-            self._models = ["openrouter/free", "google/gemma-4-31b-it:free"]
+            logger.warning(f"SprutDock: не удалось получить список моделей ({e}), используется {DEFAULT_MODEL}")
+            self._models = [self._forced_model or DEFAULT_MODEL]
 
     def _is_available(self, model: str) -> bool:
         if model not in self._exhausted_models:
@@ -1353,7 +1319,9 @@ class OpenRouterRotator:
         if not self._client:
             return None
         attempts = 0
-        while attempts < len(self._models):
+        max_attempts = len(self._models) * 3
+        while attempts < max_attempts:
+            if STOP_EVENT.is_set(): return None
             model = self._next_model()
             if not model:
                 break
@@ -1362,7 +1330,7 @@ class OpenRouterRotator:
                 resp = self._client.chat.completions.create(
                     model=model,
                     messages=[
-                        {"role": "system", "content": _system_prompt(self.target_lang, glossary)},
+                        {"role": "system", "content": _translation_system_prompt("English", self.target_lang, glossary)},
                         {"role": "user", "content": text}
                     ],
                     temperature=0.3,
@@ -1375,44 +1343,48 @@ class OpenRouterRotator:
                 err_str = str(e).lower()
                 if '429' in err_str or 'rate' in err_str or 'limit' in err_str:
                     self._exhausted_models[model] = time.time()
-                    resp = getattr(e, 'response', None)
-                    ra = getattr(resp, 'headers', {}).get('Retry-After') if resp else None
-                    delay = float(ra) if (ra and str(ra).isdigit()) else 5.0
-                    _interruptible_sleep(delay)
+                    _interruptible_sleep(5)
                     attempts += 1
                     continue
+                elif '502' in err_str or '503' in err_str or '504' in err_str or 'bad gateway' in err_str or 'server error' in err_str:
+                    logger.warning(f"   SprutDock: {model} -> {type(e).__name__}: {str(e)[:200]}, повтор...")
+                    _interruptible_sleep(3)
+                    attempts += 1
+                    continue
+                logger.warning(f"   SprutDock translate: {type(e).__name__}: {str(e)[:200]}")
                 attempts += 1
         return None
 
     def generate(self, prompt: str) -> Optional[str]:
         if not self._client:
             return None
-        model = self._next_model()
-        if not model:
-            model = self._models[0] if self._models else None
-        if not model:
-            return None
-        self.rate_limiter.acquire()
-        try:
-            resp = self._client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.3,
-            )
-            content = resp.choices[0].message.content
-            return content.strip() if content else None
-        except Exception:
-            return None
-
+        for attempt in range(3):
+            if STOP_EVENT.is_set(): return None
+            model = self._next_model()
+            if not model:
+                model = self._models[0] if self._models else None
+            if not model:
+                return None
+            self.rate_limiter.acquire()
+            try:
+                resp = self._client.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.3,
+                )
+                content = resp.choices[0].message.content
+                return content.strip() if content else None
+            except Exception as e:
+                err_str = str(e).lower()
+                if '429' in err_str or '502' in err_str or '503' in err_str or '504' in err_str or 'bad gateway' in err_str:
+                    logger.warning(f"   SprutDock generate: {type(e).__name__}: {str(e)[:200]}, повтор {attempt+1}/3...")
+                    _interruptible_sleep(3)
+                    continue
+                logger.warning(f"   SprutDock generate: {type(e).__name__}: {str(e)[:200]}")
+                return None
+        return None
 
 def _model_matches(expected: Optional[str], actual: Optional[str]) -> bool:
-    """Нестрогое сопоставление имени модели.
-
-    Сервер отдаёт в /v1/models полный путь к файлу (например,
-    '/home/ad/llm_models/translategemma-4b-it-Q4_K_M_GGUF.gguf'), а пользователь
-    может передавать короткое имя ('translate', 'translategemma', 'qwen3.5').
-    Считаем совпадением точное равенство либо вхождение одного имени в другое
-    (без учёта регистра и пути)."""
     if not expected or not actual:
         return False
     e = expected.lower()
@@ -1423,13 +1395,29 @@ def _model_matches(expected: Optional[str], actual: Optional[str]) -> bool:
     a_base = os.path.basename(a).lower()
     return any(sub in other for sub, other in ((e, a), (a, e), (e_base, a_base), (a_base, e_base)))
 
+def _is_short_citation(text: str) -> bool:
+    t = normalize_text(text)
+    if not t or len(t) > 140:
+        return False
+    citation = re.compile(
+        r"^\s*(?:\(?[A-ZÀ-ÖØ-Þ][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+(?:\s+(?:et\s+al\.?|and\s+[A-ZÀ-ÖØ-Þ][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+|&\s*[A-ZÀ-ÖØ-Þ][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+))?\s*,?\s*(?:19|20)\d{2}[a-z]?\)?|\(?(?:[A-ZÀ-ÖØ-Þ][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+(?:\s*,\s*|\s*&\s*)?)+\s*,\s*(?:19|20)\d{2}[a-z]?\)?)[.,;]?\s*$",
+        re.UNICODE,
+    )
+    if citation.match(t):
+        return True
+    if re.fullmatch(r"\s*(?:\d{1,3}(?:\s*[-–—,;]\s*\d{1,3})*|\[[0-9,\-–— ]+\])\s*[.]?\s*", t):
+        return True
+    if len(t) <= 50 and re.fullmatch(r"(?:[A-Z][A-Za-z'’\-]+(?:\s+et\s+al\.?)?)(?:\s*\(?(?:19|20)\d{2}\)?)?\.?", t):
+        return bool(re.search(r"(?:19|20)\d{2}|et\s+al", t, re.I))
+    return False
 
 class LlamaCppTranslator:
-    def __init__(self, target_lang: str, api_base: str = "http://localhost:8080/v1",
-                 expected_model: Optional[str] = None, auto_find: bool = True):
+    def __init__(self, target_lang: str, api_base: str = "http://localhost:8080/v1", expected_model: Optional[str] = None, auto_find: bool = True, max_retries: int = 3, source_lang: str = "English"):
         self.target_lang = target_lang
         self.name = "LlamaCpp"
         self.can_generate = True
+        self.max_retries = max(1, min(int(max_retries), 6))
+        self.source_lang = source_lang
         self.expected_model = expected_model
         self.rate_limiter = RateLimiter(max_requests_per_second=1)
         self._loaded_model = None
@@ -1447,6 +1435,7 @@ class LlamaCppTranslator:
                     self._loaded_model = server_model
                     self._server_ok = True
                     logger.info(f"   llama-server: {self.api_base}, модель: {self._loaded_model}")
+
         if not self._server_ok and auto_find:
             servers = self._find_all_servers()
             if not servers:
@@ -1456,26 +1445,27 @@ class LlamaCppTranslator:
                 self._loaded_model = servers[0]["model"]
                 self._server_ok = True
             else:
-                matched = [s for s in servers if _model_matches(expected_model, s["model"])]
+                matched = [x for x in servers if _model_matches(expected_model, x["model"])]
                 if matched:
                     self.api_base = matched[0]["url"]
                     self._loaded_model = matched[0]["model"]
                     self._server_ok = True
                 else:
-                    available = "\n".join(f"   {s['url']} -> {s['model']}" for s in servers)
+                    available = "\n".join(f"   {x['url']} -> {x['model']}" for x in servers)
                     raise RuntimeError(f"Модель '{expected_model}' не найдена.\n{available}")
+
         if not self._server_ok:
             raise RuntimeError("Не удалось подключиться ни к одному серверу.")
 
     @staticmethod
     def _find_all_servers() -> List[Dict[str, str]]:
-        if os.name == 'nt':
+        if os.name == "nt":
             return []
         result = []
         try:
             output = subprocess.check_output(["pgrep", "-a", "llama-server"], text=True, stderr=subprocess.DEVNULL)
             for line in output.splitlines():
-                m = re.search(r'--port\s+(\d+)', line)
+                m = re.search(r"--port\s+(\d+)", line)
                 port = int(m.group(1)) if m else 8080
                 url = f"http://localhost:{port}/v1"
                 try:
@@ -1492,7 +1482,7 @@ class LlamaCppTranslator:
 
     def _check_server(self, url: str) -> Tuple[bool, List[str]]:
         try:
-            resp = requests.get(f"{url}/models", timeout=5)
+            resp = requests.get(f"{url.rstrip('/')}/models", timeout=5)
             if resp.status_code == 200:
                 models = [m.get("id", "") for m in resp.json().get("data", [])]
                 if models:
@@ -1501,84 +1491,121 @@ class LlamaCppTranslator:
             pass
         return False, []
 
-    def _call_api(self, messages: List[Dict[str, str]], temperature: float = 0.3,
-                  max_tokens: int = 4096, timeout: int = 180) -> Optional[str]:
+    def _call_completion(self, prompt: str, temperature: float = 0.0, max_tokens: int = 2048, timeout: int = REQUEST_TIMEOUT, stop: Optional[List[str]] = None) -> Optional[str]:
         if not self._server_ok:
             return None
+        timeout = max(1, int(timeout))
         self.rate_limiter.acquire()
         try:
-            resp = requests.post(
-                f"{self.api_base}/chat/completions",
-                json={"model": self._loaded_model, "messages": messages,
-                      "temperature": temperature, "max_tokens": max_tokens, "stream": False,
-                      # Отключаем режим "размышления" у reasoning-моделей (Qwen3.5 и т.п.):
-                      # иначе ответ целиком уходит в reasoning_content, а message.content
-                      # остаётся пустым -> перевод трактуется как None и сохраняется исходник.
-                      "chat_template_kwargs": {"enable_thinking": False}},
-                timeout=timeout,
-            )
+            payload = {
+                "model": self._loaded_model,
+                "messages": [
+                    {"role": "system", "content": _translation_system_prompt(self.source_lang, self.target_lang)},
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": temperature, "top_p": 0.9, "max_tokens": max_tokens, "stream": False,
+            }
+            if stop:
+                payload["stop"] = stop
+            resp = requests.post(f"{self.api_base}/chat/completions", json=payload, timeout=timeout)
             if resp.status_code == 200:
-                content = resp.json().get("choices", [{}])[0].get("message", {}).get("content")
-                return content.strip() if content else None
+                data = resp.json()
+                choices = data.get("choices") or []
+                if choices:
+                    msg = choices[0].get("message") or {}
+                    content = msg.get("content")
+                    if content:
+                        return content.strip()
+                content = data.get("content")
+                if content:
+                    return str(content).strip()
+
+            if resp.status_code in (404, 405, 501):
+                payload2 = {"model": self._loaded_model, "prompt": prompt, "temperature": temperature, "top_p": 0.9, "max_tokens": max_tokens, "stream": False}
+                if stop:
+                    payload2["stop"] = stop
+                resp2 = requests.post(f"{self.api_base}/completions", json=payload2, timeout=timeout)
+                if resp2.status_code == 200:
+                    data = resp2.json()
+                    choices = data.get("choices") or [{}]
+                    content = data.get("content")
+                    if not content and isinstance(choices[0], dict):
+                        content = choices[0].get("text")
+                    return content.strip() if content else None
+            return None
         except Exception:
-            pass
+            return None
+
+    def _translation_prompt(self, source: str, lang: str, glossary: Optional[Dict[str, str]] = None, context_before: str = "", context_after: str = "", strict: bool = False) -> Tuple[str, Dict[str, str]]:
+        protected, tokens = _extract_protected_tokens(source)
+        sys_prompt = _translation_system_prompt(self.source_lang, lang, glossary)
+        parts = [sys_prompt, ""]
+        if context_before:
+            parts += ["CONTEXT BEFORE (READ ONLY; DO NOT TRANSLATE):", "<<<CONTEXT_BEFORE>>>", context_before, "<<<END_CONTEXT_BEFORE>>>", ""]
+        parts += ["TARGET (TRANSLATE ONLY THIS TEXT):", "<<<TARGET>>>", protected, "<<<END_TARGET>>>", ""]
+        if context_after:
+            parts += ["CONTEXT AFTER (READ ONLY; DO NOT TRANSLATE):", "<<<CONTEXT_AFTER>>>", context_after, "<<<END_CONTEXT_AFTER>>>", ""]
+        parts += ["OUTPUT ONLY THE TRANSLATION OF TARGET:"]
+        return "\n".join(parts), tokens
+
+    def translate(self, text: str, glossary: Optional[Dict[str, str]] = None, context_before: str = "", context_after: str = "", strict: bool = False, deadline: Optional[float] = None) -> Optional[str]:
+        source = normalize_text(text)
+        if not source:
+            return None
+
+        prompt, protected = self._translation_prompt(source, self.target_lang, glossary, context_before=context_before, context_after=context_after, strict=strict)
+
+        temperatures = (0.0, 0.1, 0.2)
+        for attempt in range(self.max_retries):
+            if STOP_EVENT.is_set():
+                return None
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 1.0:
+                return None
+            req_timeout = REQUEST_TIMEOUT if remaining is None else max(1, min(REQUEST_TIMEOUT, int(remaining)))
+            max_tokens = max(512, min(4096, int(len(source) / 2.0) + 512))
+
+            raw = self._call_completion(prompt, temperature=temperatures[attempt % len(temperatures)], max_tokens=max_tokens, timeout=req_timeout)
+            candidate_raw = _strip_llm_wrappers(raw)
+            candidate = _restore_protected(candidate_raw, protected)
+            ok, reason = validate_translation(source, candidate, self.target_lang)
+            if ok:
+                return candidate.strip()
+
+            if attempt + 1 < self.max_retries:
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 1.0:
+                    return None
+                _interruptible_sleep(min(1.5 * (2 ** attempt), 8.0))
         return None
 
-    def translate(self, text: str, glossary: Optional[Dict[str, str]] = None) -> Optional[str]:
-        # translategemma (и ряд других локальных моделей) не останавливается досрочно и
-        # генерирует вплоть до max_tokens. На CPU скорость ~10-15 ток/с, поэтому слишком
-        # большой лимит приводит к генерации в сотни секунд и таймауту клиента. Ограничиваем
-        # разумным потолком, зависящим от длины входа.
-        max_tokens = max(256, min(1500, (len(text) + 40) // 2))
-        return self._call_api([
-            {"role": "system", "content": _system_prompt(self.target_lang, glossary)},
-            {"role": "user", "content": text}
-        ], max_tokens=max_tokens)
-
     def generate(self, prompt: str) -> Optional[str]:
-        return self._call_api([{"role": "user", "content": prompt}], max_tokens=1024)
+        return self._call_completion(prompt, temperature=0.2, max_tokens=1024)
 
-
-# ---- Фабрика переводчиков ----
-def create_translator(translator_type: str, target_lang: str,
-                      llama_url: str = "http://localhost:8080/v1",
-                      llama_model: Optional[str] = None,
-                      auto_find: bool = True):
+def create_translator(translator_type: str, target_lang: str, llama_url: str = "http://localhost:8080/v1", llama_model: Optional[str] = None, auto_find: bool = True, sprut_model: Optional[str] = None):
     if translator_type == "llama":
-        primary = LlamaCppTranslator(target_lang, api_base=llama_url,
-                                     expected_model=llama_model, auto_find=auto_find)
-        fallback = GoogleTranslator(target_lang)
-        return primary, fallback
-    elif translator_type == "openrouter":
-        primary = OpenRouterRotator(target_lang)
-        fallback = GoogleTranslator(target_lang)
-        return primary, fallback
+        return LlamaCppTranslator(target_lang, api_base=llama_url, expected_model=llama_model, auto_find=auto_find), None
+    elif translator_type in ("openrouter", "sprut"):
+        return SprutRotator(target_lang, model=sprut_model), None
     elif translator_type == "google":
         primary = GoogleTranslator(target_lang)
         fallback = None
         if OPENAI_API_KEY:
             try:
-                or_tr = OpenRouterRotator(target_lang)
+                or_tr = SprutRotator(target_lang, model=sprut_model)
                 if or_tr._client:
                     fallback = or_tr
-                    logger.info(f"   Fallback на OpenRouter")
             except Exception:
                 pass
         if not fallback:
             try:
-                fallback = LlamaCppTranslator(target_lang, api_base=llama_url,
-                                              expected_model=llama_model, auto_find=auto_find)
-                logger.info(f"   Fallback на llama: {fallback.api_base}")
+                fallback = LlamaCppTranslator(target_lang, api_base=llama_url, expected_model=llama_model, auto_find=auto_find)
             except Exception:
                 pass
         return primary, fallback
     else:
         raise ValueError(f"Неизвестный переводчик: {translator_type}")
 
-
-# =========================================================
-# КЭШ
-# =========================================================
 class TranslationCache:
     _instance = None
     _lock = threading.Lock()
@@ -1619,9 +1646,8 @@ class TranslationCache:
                 data = json.load(f)
             for key, value in data.items():
                 self._cache[key] = value
-            logger.info(f"   Кэш загружен: {len(self._cache)} записей")
-        except Exception as e:
-            logger.warning(f"   Ошибка загрузки кэша: {e}")
+        except Exception:
+            pass
 
     def save(self):
         if not self._dirty:
@@ -1630,8 +1656,8 @@ class TranslationCache:
             with open(self.cache_path, "w", encoding="utf-8") as f:
                 json.dump(dict(self._cache), f, ensure_ascii=False)
             self._dirty = False
-        except Exception as e:
-            logger.warning(f"   Ошибка сохранения кэша: {e}")
+        except Exception:
+            pass
 
     def _key(self, text: str, lang: str) -> str:
         h = hashlib.sha256(text.encode('utf-8')).hexdigest()
@@ -1646,223 +1672,254 @@ class TranslationCache:
         if len(self._cache) % 500 == 0:
             self.save()
 
-
-# =========================================================
-# ПЕРЕВОД С RETRY + FALLBACK
-# =========================================================
-def translate_chunk_with_retry(chunk: str, translator, max_retries: int = 3,
-                               glossary: Optional[Dict[str, str]] = None) -> Optional[str]:
-    if len(chunk) < 3:
+def translate_chunk_with_retry(chunk: str, translator, max_retries: int = 3, glossary: Optional[Dict[str, str]] = None, context_before: str = "", context_after: str = "", deadline: Optional[float] = None) -> Optional[str]:
+    if not chunk or len(chunk.strip()) < 3:
         return chunk
-    for attempt in range(max_retries):
+    attempts = max(1, min(int(max_retries), 6))
+    for attempt in range(attempts):
         try:
-            translated = translator.translate(chunk, glossary)
-            if translated and len(translated) >= 2 and translated.strip() != chunk.strip():
-                return translated.strip()
-        except requests.exceptions.HTTPError as e:
-            if e.response.status_code == 429:
-                retry_after = e.response.headers.get('Retry-After')
-                # Базовая задержка с экспоненциальным ростом и джиттером
-                base_delay = (2 ** attempt) * 2.0 + random.uniform(0, 1)
-                delay = float(retry_after) if retry_after else base_delay
-                delay = min(delay, 30.0)
-                logger.warning(f"[{translator.name}] 429 Too Many Requests, пауза {delay:.1f} сек")
-                _interruptible_sleep(delay)
-                continue
-            if attempt == max_retries - 1:
-                status = e.response.status_code if e.response is not None else "?"
-                logger.warning(f"[{translator.name}] HTTP {status}")
-        except requests.exceptions.Timeout:
-            if attempt == max_retries - 1:
-                logger.warning(f"[{translator.name}] Таймаут после {max_retries} попыток")
-        except requests.exceptions.ConnectionError as e:
-            if attempt == max_retries - 1:
-                logger.warning(f"[{translator.name}] Ошибка соединения: {type(e).__name__}")
+            if hasattr(translator, "translate"):
+                if isinstance(translator, LlamaCppTranslator):
+                    translated = translator.translate(chunk, glossary=glossary, context_before=context_before, context_after=context_after, deadline=deadline)
+                else:
+                    translated = translator.translate(chunk, glossary) if glossary else translator.translate(chunk)
+            else:
+                translated = None
+
+            if translated and translated.strip():
+                return _strip_llm_wrappers(translated).strip()
+
         except Exception as e:
-            if attempt == max_retries - 1:
-                logger.warning(f"[{translator.name}] Ошибка: {type(e).__name__}")
-        # Общий бэкофф для остальных ошибок
-        _backoff(attempt, base=2.0, max_delay=20.0)
+            logger.warning(f"[{getattr(translator, 'name', 'translator')}] {type(e).__name__}: {str(e)[:160]}")
+
+        if attempt + 1 < attempts:
+            _interruptible_sleep(min(1.5 * (2 ** attempt), 60.0))
+
     return None
 
+def _split_text_for_llm(text: str, max_chars: int = 1800, min_chunk_chars: int = 650) -> List[str]:
+    text = normalize_text(text)
+    if len(text) <= max_chars:
+        return [text]
+    protected_abbr = re.compile(r"\b(?:e\.g|i\.e|et al|fig|figs|eq|eqs|dr|mr|mrs|ms|prof|no|nos|vs|approx|ca|p|pp)\.$", re.I)
+    parts = []
+    start = 0
+    for m in re.finditer(r"[.!?。！？](?:[\"'”’\)\]]*)\s+(?=[A-ZА-ЯЁ0-9])", text):
+        left = text[start:m.end()].strip()
+        if not left:
+            continue
+        if protected_abbr.search(left[-12:]):
+            continue
+        parts.append(left)
+        start = m.end()
+    tail = text[start:].strip()
+    if tail:
+        parts.append(tail)
 
-# =========================================================
-# PIPELINE ПЕРЕВОДА
-# =========================================================
+    if len(parts) <= 1:
+        words = text.split()
+        chunks, cur = [], []
+        cur_len = 0
+        for word in words:
+            add_len = len(word) + (1 if cur else 0)
+            if cur and cur_len + add_len > max_chars:
+                chunks.append(" ".join(cur))
+                cur, cur_len = [word], len(word)
+            else:
+                cur.append(word)
+                cur_len += add_len
+        if cur:
+            chunks.append(" ".join(cur))
+        return chunks
+
+    chunks, cur, cur_len = [], [], 0
+    for part in parts:
+        plen = len(part)
+        if cur and cur_len + plen + 1 > max_chars:
+            chunks.append(" ".join(cur))
+            cur, cur_len = [], 0
+        cur.append(part)
+        cur_len += plen + (1 if cur_len else 0)
+    if cur:
+        chunks.append(" ".join(cur))
+
+    merged = []
+    for ch in chunks:
+        if merged and len(ch) < min_chunk_chars and len(merged[-1]) + len(ch) + 1 <= max_chars:
+            merged[-1] += " " + ch
+        else:
+            merged.append(ch)
+    return merged
+
 class TranslationPipeline:
-    def __init__(self, translator, fallback=None, cache: Optional[TranslationCache] = None,
-                 max_workers: int = 8, timeout: int = 600, is_local: bool = False,
-                 translator_type: str = "google", refine: bool = False):
+    def __init__(self, translator, fallback=None, cache: Optional[TranslationCache] = None, max_workers: int = 4, timeout: int = BLOCK_TIMEOUT, is_local: bool = False, translator_type: str = "google"):
         self.translator = translator
         self.fallback = fallback
         self.cache = cache or TranslationCache()
         self.max_workers = max_workers
-        self.timeout = timeout
+        self.block_timeout = max(30, int(timeout or BLOCK_TIMEOUT))
         self.is_local = is_local
         self.translator_type = translator_type
-        self.refine = refine
-        self.stats = {"success": 0, "failed": 0, "cached": 0, "skipped": 0}
+        self.stats = {"success": 0, "failed": 0, "cached": 0, "skipped": 0, "rejected": 0}
         self._stats_lock = threading.Lock()
         self._start_time = 0.0
         self._block_times = []
 
-    BASE_SKIP_TYPES = ("figure", "table", "empty")
-    MAX_SECTION_CHARS = 3000
+    BASE_SKIP_TYPES = ("figure", "table", "empty", "metadata")
+    MAX_SECTION_CHARS = 2500
+    MAX_LLM_CHUNK_CHARS = 1800
+    MIN_LLM_CHUNK_CHARS = 650
+    RESCUE_MIN_CHARS = int(SETTINGS.get("llm_rescue_min_chars", 220))
 
     def _skip_types(self) -> Tuple[str, ...]:
         return self.BASE_SKIP_TYPES + ("reference", "reference_heading")
 
-    def _translate_one(self, text: str, lang: str,
-                       glossary: Optional[Dict[str, str]] = None) -> Optional[str]:
+    @staticmethod
+    def _safe_cache_get(cache, text, lang):
+        value = cache.get(text, lang)
+        if value and value.strip():
+            ok, _ = validate_translation(text, value, lang)
+            return value if ok else None
+        return None
+
+    def _translate_one(self, text: str, lang: str, glossary: Optional[Dict[str, str]] = None, context_before: str = "", context_after: str = "", _allow_split: bool = True, _deadline: Optional[float] = None) -> Optional[str]:
         text = normalize_text(text)
         if not text:
             return None
-        protected, refs = protect_refs(text)
-        cached = None if refs else self.cache.get(text, lang)
+
+        deadline = _deadline if _deadline is not None else time.monotonic() + self.block_timeout
+        if time.monotonic() >= deadline:
+            return None
+
+        if _is_short_citation(text):
+            return text
+
+        if _allow_split and len(text) > self.MAX_LLM_CHUNK_CHARS:
+            chunks = _split_text_for_llm(text, self.MAX_LLM_CHUNK_CHARS, self.MIN_LLM_CHUNK_CHARS)
+            if len(chunks) > 1:
+                out = []
+                for i, chunk in enumerate(chunks):
+                    r = self._translate_one(
+                        chunk, lang, glossary,
+                        context_before=context_before[-500:] if i == 0 else "",
+                        context_after=context_after[:500] if i == len(chunks)-1 else "",
+                        _allow_split=False, _deadline=deadline,
+                    )
+                    if not r:
+                        r = self._rescue_block(chunk, lang, glossary, "", "", deadline)
+                        if not r:
+                            return None
+                    out.append(r.strip())
+                return " ".join(out)
+
+        protected, tokens = _extract_protected_tokens(text)
+        cached = self._safe_cache_get(self.cache, text, lang)
         if cached:
             with self._stats_lock:
                 self.stats["cached"] += 1
             return cached
-        t0 = time.time()
-        # Локальный движок: больше попыток и НЕ сразу уходим в Google.
-        # Только исчерпав повторы, используем fallback (Google).
-        local_retries = 8 if self.is_local else 3
-        result = translate_chunk_with_retry(protected, self.translator,
-                                            max_retries=local_retries, glossary=glossary)
-        if not result and self.fallback:
-            logger.info(f"   Локальный перевод не дал результата за {local_retries} попыток, "
-                        f"переключаюсь на fallback ({self.fallback.name})")
-            result = translate_chunk_with_retry(protected, self.fallback, glossary=glossary)
-        if result and refs:
-            result = restore_refs(result, refs)
-            missing = [orig for orig in refs.values() if orig not in result]
-            if missing:
-                # повторная попытка на ре-защищённом тексте (исправление: ранее
-                # переводился сырой text, из-за чего restore_refs не срабатывал)
-                protected2, _ = protect_refs(text)
-                result2 = translate_chunk_with_retry(protected2, self.translator,
-                                                     max_retries=local_retries, glossary=glossary)
-                if not result2 and self.fallback:
-                    result2 = translate_chunk_with_retry(protected2, self.fallback, glossary=glossary)
-                if result2:
-                    result2 = restore_refs(result2, refs)
-                base = result2 if result2 else result
-                missing2 = [orig for orig in refs.values() if orig not in base]
-                if missing2:
-                    result = self._reinsert_missing_refs(base, protected2, refs, missing2)
-                    missing = [orig for orig in refs.values() if orig not in result]
-                else:
-                    result = result2
-                    missing = []
-            if missing:
-                logger.warning(f"   Ссылки {missing} восстановлены и вставлены в текст")
-        if result and self.refine and self.is_local and getattr(self.translator, 'can_generate', False):
-            refined = self._refine(result, lang)
-            if refined:
-                if refs and all(orig in refined for orig in refs.values()):
-                    result = refined
-                elif not refs:
-                    result = refined
-        elapsed = time.time() - t0
-        with self._stats_lock:
-            self._block_times.append(elapsed)
+
+        result = translate_chunk_with_retry(
+            text if isinstance(self.translator, LlamaCppTranslator) else protected,
+            self.translator,
+            max_retries=1 if isinstance(self.translator, LlamaCppTranslator) else 2,
+            glossary=glossary, context_before=context_before, context_after=context_after, deadline=deadline,
+        )
+
+        if result:
+            result = _strip_llm_wrappers(_restore_protected(result, tokens)).strip()
+            valid, reason = validate_translation(text, result, lang)
+            if not valid:
+                result = None
+                with self._stats_lock:
+                    self.stats["rejected"] += 1
+
+        if not result and self.fallback and time.monotonic() < deadline:
+            result = translate_chunk_with_retry(
+                protected if not isinstance(self.fallback, LlamaCppTranslator) else text,
+                self.fallback, max_retries=2, glossary=glossary, deadline=deadline,
+            )
+            if result:
+                result = _strip_llm_wrappers(_restore_protected(result, tokens)).strip()
+                valid, _ = validate_translation(text, result, lang)
+                if not valid:
+                    result = None
+
         if result:
             self.cache.put(text, lang, result)
             with self._stats_lock:
                 self.stats["success"] += 1
-        else:
-            with self._stats_lock:
-                self.stats["failed"] += 1
-        return result
+            return result
 
-    def _reinsert_missing_refs(self, result: str, protected: str,
-                               refs: Dict[str, str], missing: List[str]) -> str:
-        """Вставляет пропавшие ссылки обратно в текст, сохраняя примерную позицию."""
-        total = len(protected) or 1
-        inserts = []
-        for ph, orig in refs.items():
-            if orig in missing:
-                idx = protected.find(ph)
-                if idx >= 0:
-                    inserts.append((idx / total, orig))
-        r = result or ""
-        if not inserts:
-            return r + " " + " ".join(missing)
-        inserts.sort(key=lambda x: x[0])
+        if _allow_split and time.monotonic() < deadline:
+            rescued = self._rescue_block(text, lang, glossary, context_before, context_after, deadline)
+            if rescued:
+                self.cache.put(text, lang, rescued)
+                with self._stats_lock:
+                    self.stats["success"] += 1
+                return rescued
 
-        def _snap(pos: int) -> int:
-            if pos <= 0 or pos >= len(r):
-                return max(0, min(pos, len(r)))
-            if r[pos].isspace() or r[pos - 1].isspace():
-                return pos
-            back = r.rfind(' ', 0, pos)
-            fwd = r.find(' ', pos)
-            if back == -1 and fwd == -1:
-                return pos
-            if back == -1:
-                return fwd
-            if fwd == -1:
-                return back + 1
-            return back + 1 if (pos - back) <= (fwd - pos) else fwd
-
-        points = [(int(ratio * len(r)), orig) for ratio, orig in inserts]
-        points.sort(reverse=True)
-        for pos, orig in points:
-            pos = _snap(max(0, min(pos, len(r))))
-            r = r[:pos] + " " + orig + " " + r[pos:]
-        return r
-
-    def _refine(self, translated: str, lang: str) -> Optional[str]:
-        prompt = REFINE_PROMPT.format(lang=lang) + "\n\n" + translated
-        try:
-            res = self.translator.generate(prompt)
-            if res and len(res) >= 2:
-                return res.strip()
-        except Exception:
-            pass
+        with self._stats_lock:
+            self.stats["failed"] += 1
         return None
 
-    def _translate_group(self, group: list, lang: str,
-                         glossary: Optional[Dict[str, str]] = None,
-                         quiet: bool = False) -> None:
-        parts = [b.text for b in group]
-        combined = "\n\n".join(parts)
-        result = self._translate_one(combined, lang, glossary)
-        if result:
-            translated_parts = [p.strip() for p in re.split(r'\n\s*\n', result.strip()) if p.strip()]
-            if len(translated_parts) == len(parts):
-                for b, tp in zip(group, translated_parts):
-                    b.translation = tp or b.text
-                return
-            if not quiet:
-                logger.info(f"   Секция: {len(translated_parts)}/{len(parts)} абзацев, перевод по одному")
-        for b in group:
-            res = self._translate_one(b.text, lang, glossary)
-            b.translation = res if res else b.text
+    def _rescue_block(self, text: str, lang: str, glossary: Optional[Dict[str, str]], context_before: str, context_after: str, deadline: float) -> Optional[str]:
+        if time.monotonic() >= deadline:
+            return None
+        sizes = [900, 600, 420, self.RESCUE_MIN_CHARS]
+        for size in sizes:
+            if len(text) <= size:
+                continue
+            chunks = _split_text_for_llm(text, size, max(80, min(self.MIN_LLM_CHUNK_CHARS, size // 3)))
+            if len(chunks) <= 1:
+                continue
+            out = []
+            ok = True
+            for i, chunk in enumerate(chunks):
+                if time.monotonic() >= deadline:
+                    return None
+                r = self._translate_one(
+                    chunk, lang, glossary,
+                    context_before=context_before[-300:] if i == 0 else "",
+                    context_after=context_after[:300] if i == len(chunks)-1 else "",
+                    _allow_split=False, _deadline=deadline,
+                )
+                if not r:
+                    ok = False
+                    break
+                out.append(r.strip())
+            if ok and out:
+                return " ".join(out)
+        return None
 
     def _translate_table(self, block: Block, lang: str, quiet: bool = False) -> None:
         rows = block.table_data or []
         if not rows:
             return
         md_lines = []
-        for i, row in enumerate(rows[:20]):
+        for i, row in enumerate(rows):
             cells = [str(c).replace("|", "\\|").replace("\n", " ") for c in row]
             md_lines.append("| " + " | ".join(cells) + " |")
             if i == 0 and len(rows) > 1:
                 md_lines.append("| " + " | ".join(["---"] * len(row)) + " |")
         md_table = "\n".join(md_lines)
-        prompt = TABLE_TRANSLATE_PROMPT.format(lang=lang) + "\n\n" + md_table
+
+        prompt = TABLE_TRANSLATE_PROMPT.format(lang=_LANG_NAMES.get(lang, lang)) + "\n\nTABLE:\n<<<\n" + md_table + "\n>>>"
         try:
-            raw = self.translator.generate(prompt)
+            raw = self.translator.generate(prompt) if getattr(self.translator, "can_generate", False) else None
         except Exception:
             raw = None
+
         if not raw:
             return
-        parsed = self._parse_md_table(raw)
-        if parsed:
-            block.table_data = parsed
-            if not quiet:
-                logger.info(f"   Таблица (стр. {block.page_num}): переведена")
+
+        parsed = self._parse_md_table(_strip_llm_wrappers(raw))
+        if parsed and len(parsed) == len(rows):
+            expected_cols = max((len(r) for r in rows), default=0)
+            if all(len(r) == expected_cols for r in parsed):
+                block.table_data = parsed
+                if not quiet:
+                    logger.info(f"   Таблица (стр. {block.page_num}): переведена")
 
     @staticmethod
     def _parse_md_table(raw: str) -> Optional[List[List[str]]]:
@@ -1874,10 +1931,23 @@ class TranslationPipeline:
             if not ln.startswith("|"):
                 ln = "|" + ln + "|"
             cells = [c.strip() for c in ln.strip("|").split("|")]
-            if cells and all(re.fullmatch(r':?-+:?', c) for c in cells):
+            if cells and all(re.fullmatch(r":?-+:?", c) for c in cells):
                 continue
             rows.append(cells)
         return rows if rows else None
+
+    def _translate_section(self, section: list, lang: str, glossary: Optional[Dict[str, str]] = None) -> None:
+        for idx, block in enumerate(section):
+            if STOP_EVENT.is_set():
+                return
+            before = section[idx - 1].text if idx > 0 else ""
+            after = section[idx + 1].text if idx + 1 < len(section) else ""
+            result = self._translate_one(
+                block.text, lang, glossary,
+                context_before=before[-600:],
+                context_after=after[:600],
+            )
+            block.translation = result
 
     def translate_blocks(self, blocks: list, lang: str, quiet: bool = False) -> list:
         merged_blocks = []
@@ -1885,30 +1955,20 @@ class TranslationPipeline:
 
         for block in blocks:
             text = block.text
-            if not text or len(text) < 2:
+            if not text or len(text) < 2 or block.type in skip_types:
                 block.translation = text if text else ""
                 with self._stats_lock:
                     self.stats["skipped"] += 1
                 merged_blocks.append(block)
                 continue
-            if block.type in ("figure", "table", "empty"):
-                block.translation = text
-                with self._stats_lock:
-                    self.stats["skipped"] += 1
-                merged_blocks.append(block)
-                continue
-            if block.type in ("reference", "reference_heading"):
-                block.translation = text
-                with self._stats_lock:
-                    self.stats["skipped"] += 1
-                merged_blocks.append(block)
-                continue
+
             if block.type in ("paragraph", "list", "text"):
                 _wrap_citation_spans(block)
             merged_blocks.append(block)
+
         blocks = merged_blocks
 
-        if getattr(self.translator, 'can_generate', False):
+        if getattr(self.translator, "can_generate", False):
             for block in blocks:
                 if block.type == "table" and block.table_data:
                     self._translate_table(block, lang, quiet)
@@ -1918,75 +1978,33 @@ class TranslationPipeline:
             return blocks
 
         glossary = None
-        if getattr(self.translator, 'can_generate', False):
-            sample = "\n\n".join(b.text for b in translatable)[:6000]
-            if sample:
-                glossary = extract_glossary(sample, self.translator, lang, self.cache)
-                if glossary and not quiet:
-                    logger.info(f"   Глоссарий: {len(glossary)} терминов")
-
         sections = []
         current = []
-        for b in blocks:
-            if b.type in skip_types or b.translation is not None:
-                if current:
-                    sections.append(current)
-                    current = []
-                continue
+        cur_len = 0
+        for b in translatable:
+            blen = len(b.text)
+            if current and cur_len + blen > self.MAX_SECTION_CHARS:
+                sections.append(current)
+                current = []
+                cur_len = 0
             current.append(b)
+            cur_len += blen
         if current:
             sections.append(current)
 
-        tasks = []
-        if self.is_local:
-            # Локальный движок (CPU, однослотовый сервер): переводим строго по
-            # абзацам. Группировка здесь невыгодна — модель редко возвращает ровно
-            # N абзацев, проверка «число абзацев совпало» не проходит и запрос
-            # дублируется построчным переводом, а длинные сгруппированные запросы
-            # генерируют до max_tokens и подвисают.
-            for sec in sections:
-                for b in sec:
-                    tasks.append([b])
-        else:
-            for sec in sections:
-                if sum(len(b.text) for b in sec) <= self.MAX_SECTION_CHARS:
-                    tasks.append(sec)
-                    continue
-                group = []
-                group_len = 0
-                for b in sec:
-                    if group and group_len + len(b.text) > self.MAX_SECTION_CHARS:
-                        tasks.append(group)
-                        group = [b]
-                        group_len = len(b.text)
-                    else:
-                        group.append(b)
-                        group_len += len(b.text)
-            if group:
-                tasks.append(group)
-
-        total = len(tasks)
+        total = len(sections)
         done = 0
         lock = threading.Lock()
         self._start_time = time.time()
 
         if not quiet:
-            logger.info(f"   Блоков для перевода: {len(translatable)} (секций: {total})")
+            logger.info(f"   Блоков для перевода: {len(translatable)} (секций контекста: {total})")
 
         def _work(group):
             nonlocal done
             if STOP_EVENT.is_set():
-                for b in group:
-                    b.translation = b.text
                 return
-            if len(group) == 1:
-                b = group[0]
-                result = self._translate_one(b.text, lang, glossary)
-                b.translation = result if result else b.text
-            else:
-                self._translate_group(group, lang, glossary, quiet)
-            if STOP_EVENT.is_set():
-                return
+            self._translate_section(group, lang, glossary)
             with lock:
                 done += 1
                 if TQDM and not quiet:
@@ -2002,24 +2020,21 @@ class TranslationPipeline:
                     logger.info(f"   {done}/{total} ({done*100//total}%) {_format_time(elapsed)} ETA: {_format_time(remaining)}")
 
         if TQDM and not quiet:
-            pbar = tqdm(total=total, desc="🌐 Перевод", unit="блок",
-                        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]")
+            pbar = tqdm(total=total, desc="🌐 Перевод", unit="секция", bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]")
 
         _start_keyboard_watchdog()
-        executor = _DaemonThreadPool(max_workers=self.max_workers)
-        futures = {}
+        executor = ThreadPoolExecutor(max_workers=max(1, min(self.max_workers, 4)))
+        futures = {executor.submit(_work, g): g for g in sections}
+
         try:
-            futures = {executor.submit(_work, g): g for g in tasks}
-        except Exception:
-            pass
-        try:
-            for future in as_completed(futures):
-                if STOP_EVENT.is_set():
-                    break
-                try:
-                    future.result()
-                except Exception:
-                    pass
+            while futures and not STOP_EVENT.is_set():
+                done_futures, _ = wait(futures, timeout=0.5, return_when=FIRST_COMPLETED)
+                for future in done_futures:
+                    futures.pop(future, None)
+                    try:
+                        future.result()
+                    except Exception as e:
+                        logger.warning(f"   Ошибка секции: {type(e).__name__}: {e}")
         except KeyboardInterrupt:
             STOP_EVENT.set()
             logger.warning("⏹ Прервано пользователем (Ctrl+C)")
@@ -2030,37 +2045,17 @@ class TranslationPipeline:
                 executor.shutdown(wait=False, cancel_futures=True)
             except TypeError:
                 executor.shutdown(wait=False)
-            if STOP_EVENT.is_set():
-                # Восстанавливаем оригинал для блоков, перевод которых не завершён
-                for b in blocks:
-                    if b.translation is None and b.type not in skip_types:
-                        b.translation = b.text
             if TQDM and not quiet:
                 pbar.close()
 
         if not quiet:
             elapsed = time.time() - self._start_time
             logger.info(f"   Перевод завершён за {_format_time(elapsed)}")
-            if self._block_times:
-                avg = sum(self._block_times) / len(self._block_times)
-                logger.info(f"   Среднее время на блок: {avg:.1f} сек")
+            logger.info(f"   LLM guard: успешно={self.stats['success']}, кэш={self.stats['cached']}, отклонено={self.stats['rejected']}, ошибки={self.stats['failed']}")
+
         return blocks
 
-
-# =========================================================
-# ГЕНЕРАЦИЯ РЕФЕРАТА
-# =========================================================
-def generate_summary(
-    pages: list,
-    summary_translator_type: str,
-    translate_translator_type: str,
-    lang: str,
-    llama_url: str = "http://localhost:8080/v1",
-    llama_model: Optional[str] = None,
-    auto_find: bool = True,
-    quiet: bool = False,
-) -> Dict[str, Any]:
-
+def generate_summary(pages: list, summary_translator_type: str, translate_translator_type: str, lang: str, llama_url: str = "http://localhost:8080/v1", llama_model: Optional[str] = None, auto_find: bool = True, sprut_model: Optional[str] = None, quiet: bool = False) -> Dict[str, Any]:
     all_text = []
     for page in pages:
         for block in page.blocks:
@@ -2073,133 +2068,52 @@ def generate_summary(
         return {"summary_html": "<p>Не удалось извлечь текст для реферата.</p>", "stats": {"chunks": 0, "tokens": 0, "speed": 0}}
 
     if summary_translator_type == "google":
-        logger.warning("   Google Translate не поддерживает генерацию. Переключаю на llama.")
         summary_translator_type = "llama"
 
-    summary_translator = None
     try:
-        summary_translator, _ = create_translator(
-            summary_translator_type, "en",
-            llama_url=llama_url, llama_model=llama_model, auto_find=auto_find,
-        )
-    except RuntimeError as e:
-        logger.error(f"   Не удалось создать генератор ({summary_translator_type}): {e}")
-        if summary_translator_type == "llama":
-            summary_translator = GoogleTranslator("en")
-        else:
-            return {
-                "summary_html": "<p>Ошибка: нет LLM для генерации реферата.</p>",
-                "stats": {"chunks": 0, "tokens": 0, "speed": 0, "error": str(e)}
-            }
-    logger.info(f"   Генератор реферата: {summary_translator.name}")
+        summary_translator, _ = create_translator(summary_translator_type, "en", llama_url=llama_url, llama_model=llama_model, auto_find=auto_find, sprut_model=sprut_model)
+    except Exception as e:
+        return {"summary_html": f"<p>Ошибка LLM: {e}</p>", "stats": {"chunks": 0, "tokens": 0, "speed": 0, "error": str(e)}}
 
-    final_translator = None
-    if translate_translator_type == "llama":
-        try:
-            final_translator, _ = create_translator("llama", lang,
-                llama_url=llama_url, llama_model=llama_model, auto_find=auto_find)
-        except RuntimeError:
-            final_translator = GoogleTranslator(lang)
-    else:
-        final_translator = GoogleTranslator(lang)
-    logger.info(f"   Переводчик реферата: {final_translator.name}")
-
-    if not getattr(summary_translator, 'can_generate', False):
-        logger.warning(f"   {summary_translator.name} не поддерживает generate(). Попытка найти LLM...")
-        try:
-            summary_translator, _ = create_translator("llama", "en",
-                llama_url=llama_url, llama_model=llama_model, auto_find=auto_find)
-            logger.info(f"   Генератор реферата: {summary_translator.name}")
-        except RuntimeError:
-            logger.error("   Ни один генератор не поддерживает generate().")
-            return {
-                "summary_html": "<p>Ошибка: нет LLM-сервера. Запустите llama-server.</p>",
-                "stats": {"chunks": 0, "tokens": 0, "speed": 0, "error": "no LLM"}
-            }
+    try:
+        final_translator, _ = create_translator(translate_translator_type, lang, llama_url=llama_url, llama_model=llama_model, auto_find=auto_find, sprut_model=sprut_model)
+    except Exception as e:
+        return {"summary_html": f"<p>Ошибка переводчика: {e}</p>", "stats": {"chunks": 0, "tokens": 0, "speed": 0, "error": str(e)}}
 
     chunks = _chunk_text_by_sentences(full_text, max_chunk_size=6000)
-    if not quiet:
-        logger.info(f"   Чанков для реферата: {len(chunks)}")
-
     cache = TranslationCache()
     cache_key = f"summary:{summary_translator_type}"
-
     chunk_summaries = []
     start_time = time.time()
     total_tokens = 0
-
-    if TQDM and not quiet:
-        pbar = tqdm(total=len(chunks), desc="📝 Реферат", unit="чанк",
-                    bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]")
 
     for i, chunk in enumerate(chunks):
         cached = cache.get(chunk, cache_key)
         if cached:
             chunk_summaries.append(cached)
-            total_tokens += len(cached) // 4
-            if TQDM and not quiet:
-                pbar.update(1)
             continue
         prompt = "Extract key facts from this text for a summary. Write the summary in English:\n" + chunk
-        summary = None
-        for attempt in range(2):
-            try:
-                summary = summary_translator.generate(prompt)
-                if summary:
-                    break
-            except Exception as e:
-                logger.warning(f"   Чанк {i+1}: ошибка (попытка {attempt+1}): {e}")
+        summary = summary_translator.generate(prompt)
         if summary:
             cache.put(chunk, cache_key, summary)
             chunk_summaries.append(summary)
             total_tokens += len(summary) // 4
-        else:
-            chunk_summaries.append(chunk)
-            total_tokens += len(chunk) // 4
-        if TQDM and not quiet:
-            elapsed = time.time() - start_time
-            avg = elapsed / (i + 1)
-            remaining = avg * (len(chunks) - i - 1)
-            pbar.set_postfix_str(f"ост. {_format_time(remaining)}", refresh=True)
-            pbar.update(1)
-
-    if TQDM and not quiet:
-        pbar.close()
 
     if not chunk_summaries:
         return {"summary_html": "<p>Не удалось сгенерировать реферат.</p>", "stats": {"chunks": 0, "tokens": 0, "speed": 0}}
 
     summaries_to_combine = chunk_summaries
     if len(chunk_summaries) > 5:
-        if not quiet:
-            logger.info(f"   Иерархическая суммаризация ({len(chunk_summaries)} промежуточных)...")
         grouped = []
         for j in range(0, len(chunk_summaries), 5):
             group = chunk_summaries[j:j + 5]
             group_prompt = "Combine these key points into a concise summary:\n" + "\n---\n".join(group)
             group_summary = summary_translator.generate(group_prompt)
-            if group_summary:
-                grouped.append(group_summary)
-                total_tokens += len(group_summary) // 4
-            else:
-                grouped.extend(group)
+            grouped.append(group_summary if group_summary else "\n".join(group))
         summaries_to_combine = grouped
 
-    final_prompt = (
-        "Based on the following key points, create a final structured summary in English "
-        "strictly in the format:\nBRIEF CONTENT: 4-5 sentences\nKEY FINDINGS: list\nSTRENGTHS: list\nWEAKNESSES: list\n\n"
-        "Key points:\n" + "\n---\n".join(summaries_to_combine)
-    )
-    summary_en = None
-    for attempt in range(2):
-        try:
-            summary_en = summary_translator.generate(final_prompt)
-            if summary_en:
-                break
-        except Exception as e:
-            logger.warning(f"   Итоговый реферат: ошибка (попытка {attempt+1}): {e}")
-    if not summary_en:
-        summary_en = "\n\n".join(summaries_to_combine)
+    final_prompt = "Based on the following key points, create a final structured summary in English strictly in the format:\nBRIEF CONTENT: 4-5 sentences\nKEY FINDINGS: list\nSTRENGTHS: list\nWEAKNESSES: list\n\nKey points:\n" + "\n---\n".join(summaries_to_combine)
+    summary_en = summary_translator.generate(final_prompt) or "\n\n".join(summaries_to_combine)
 
     try:
         final_translated = final_translator.translate(summary_en)
@@ -2209,104 +2123,74 @@ def generate_summary(
 
     elapsed = time.time() - start_time
     speed = total_tokens / elapsed if elapsed > 0 else 0
-    actual_model = getattr(summary_translator, '_loaded_model', summary_translator.name)
-    stats = {"chunks": len(chunks), "tokens": total_tokens, "speed": speed, "model": actual_model, "time": elapsed}
-    return {"summary_html": summary_html, "stats": stats}
+    return {"summary_html": summary_html, "stats": {"chunks": len(chunks), "tokens": total_tokens, "speed": speed, "model": getattr(summary_translator, '_loaded_model', summary_translator.name), "time": elapsed}}
 
-
-# =========================================================
-# HTML — единый Jinja2-шаблон (тёмная/светлая тема)
-# =========================================================
-BLOCK_CSS = """
+# ИСПРАВЛЕНИЕ 4: Узкие поля в CSS
+_CSS_TEMPLATE = string.Template("""
 <style>
-body { font-family: 'Segoe UI', Arial, sans-serif; margin: 0; padding: 0; background: #0f172a; color: #e2e8f0; }
-.container { max-width: 960px; margin: 0 auto; padding: 24px; }
-h1 { color: #60a5fa; border-bottom: 2px solid #1e3a5f; padding-bottom: 12px; }
-h3 { color: #93c5fd; margin-top: 28px; }
-.page { background: #1e293b; padding: 20px; margin-bottom: 20px; border-radius: 8px; border: 1px solid #334155; }
-.page > summary { cursor: pointer; font-size: 1.05em; font-weight: bold; color: #93c5fd; padding: 4px 0 8px; user-select: none; }
-.page > summary:hover { color: #60a5fa; }
+body { font-family: $BODY_FONT; margin: $BODY_MARGIN; background: $BG; color: $TEXT; }
+.container { max-width: 1100px; margin: 0 auto; padding: 20px 40px; }
+h1 { color: $H1_COLOR; border-bottom: 2px solid $H1_BORDER; padding-bottom: 12px; }
+h3 { color: $H3_COLOR; margin-top: 28px; }
+.page { background: $PAGE_BG; padding: 15px 20px; margin-bottom: 20px; border-radius: 8px; $PAGE_BOX }
+.page > summary { cursor: pointer; font-size: 1.05em; font-weight: bold; color: $SUMMARY_COLOR; padding: 4px 0 8px; user-select: none; }
+.page > summary:hover { color: $SUMMARY_HOVER; }
 .trans-head { border-left: 3px solid #3b82f6; padding-left: 12px; margin: 12px 0; }
 .trans-head h2, .trans-head h3, .trans-head h4 { margin: 4px 0; }
 p { line-height: 1.7; margin: 0 0 10px; text-align: justify; }
-.orig { color: #64748b; font-size: 0.88em; }
-.trans { color: #e2e8f0; }
-.ref-section h2 { color: #60a5fa; border-top: 2px solid #334155; margin-top: 24px; padding-top: 16px; padding-bottom: 6px; }
-.ref { color: #64748b; font-size: 0.88em; margin-left: 16px; font-family: 'Courier New', monospace; line-height: 1.4; margin-bottom: 8px; }
-.meta { color: #64748b; font-size: 0.82em; margin-bottom: 16px; padding-bottom: 8px; border-bottom: 1px solid #334155; }
-.table-wrap { overflow-x: auto; margin: 12px 0; border-radius: 8px; border: 1px solid #334155; }
+.orig { color: $ORIG_COLOR; font-size: 0.88em; }
+.trans { color: $TEXT; }
+.ref-section h2 { color: $H1_COLOR; border-top: 2px solid $TABLEWRAP_BORDER; margin-top: 24px; padding-top: 16px; padding-bottom: 6px; }
+.ref { color: $REF_COLOR; font-size: 0.88em; margin-left: 16px; font-family: 'Courier New', monospace; line-height: 1.4; margin-bottom: 8px; }
+.meta { color: $META_COLOR; font-size: 0.82em; margin-bottom: 16px; padding-bottom: 8px; border-bottom: 1px solid $TABLEWRAP_BORDER; }
+.table-wrap { overflow-x: auto; margin: 12px 0; border-radius: 8px; border: 1px solid $TABLEWRAP_BORDER; }
 .table-wrap table { width: 100%; border-collapse: collapse; font-size: 0.88em; }
-.table-wrap th { background: #0f172a; border: 1px solid #334155; padding: 8px 10px; color: #60a5fa; }
-.table-wrap td { border: 1px solid #334155; padding: 6px 10px; }
+.table-wrap th { background: $TH_BG; border: 1px solid $TABLEWRAP_BORDER; padding: 8px 10px; color: $TH_COLOR; }
+.table-wrap td { border: 1px solid $TABLEWRAP_BORDER; padding: 6px 10px; }
 .figure { margin: 20px 0; text-align: center; }
 .figure img { max-width: 100%; height: auto; border-radius: 6px; cursor: zoom-in; }
-.figure-caption { margin-top: 6px; font-style: italic; color: #94a3b8; font-size: 0.85em; }
+.figure-caption { margin-top: 6px; font-style: italic; color: $CAPTION_COLOR; font-size: 0.85em; }
 .list-block { margin-left: 20px; line-height: 1.6; }
-.ref-link { color: #60a5fa; font-weight: bold; }
-.table-wrap tbody tr:nth-child(even) td { background: #16213a; }
+.ref-link { color: $REFLINK_COLOR; font-weight: bold; }
+.table-wrap tbody tr:nth-child(even) td { background: $TBODY_EVEN; }
 .table-pre { white-space: pre-wrap; font-family: 'Courier New', monospace; font-size: 0.85em; margin: 8px 0; }
-.table-caption { font-style: italic; color: #94a3b8; font-size: 0.85em; margin: 8px 0; }
-.toc { background: #1e293b; border: 1px solid #334155; border-radius: 8px; padding: 14px 20px; margin-bottom: 20px; }
+.table-caption { font-style: italic; color: $CAPTION_COLOR; font-size: 0.85em; margin: 8px 0; }
+.toc { background: $TOC_BG; border: 1px solid $TOC_BORDER; border-radius: 8px; padding: 14px 20px; margin-bottom: 20px; }
 .toc ul { list-style: none; margin: 6px 0 0; padding-left: 18px; }
 .toc > ul { padding-left: 0; }
-.toc a { color: #93c5fd; text-decoration: none; }
+.toc a { color: $TOC_A; text-decoration: none; }
 .toc a:hover { text-decoration: underline; }
-.btn-orig { background: #1e293b; border: 1px solid #334155; color: #94a3b8; border-radius: 6px; padding: 6px 12px; margin: 0 4px 12px 0; cursor: pointer; }
-.btn-orig:hover { color: #e2e8f0; }
+.btn-orig { background: $BTN_BG; border: 1px solid $BTN_BORDER; color: $BTN_COLOR; border-radius: 6px; padding: 6px 12px; margin: 0 4px 12px 0; cursor: pointer; }
+.btn-orig:hover { color: $BTN_HOVER; }
 details.original-block { margin: 4px 0; }
-details.original-block summary { color: #64748b; font-size: 0.85em; cursor: pointer; }
-details.original-block summary:hover { color: #94a3b8; }
+details.original-block summary { color: $DETAILS_COLOR; font-size: 0.85em; cursor: pointer; }
+details.original-block summary:hover { color: $DETAILS_HOVER; }
 #lightbox { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.85); z-index: 999; align-items: center; justify-content: center; cursor: zoom-out; }
 #lightbox img { max-width: 92%; max-height: 92%; border-radius: 6px; }
 </style>
-"""
+""")
 
-BLOCK_CSS_LIGHT = """
-<style>
-body { font-family: Arial, sans-serif; margin: 40px; background: #f0f2f5; }
-.container { max-width: 960px; margin: 0 auto; }
-h1 { color: #1f2937; border-bottom: 2px solid #d1d5db; padding-bottom: 12px; }
-h3 { color: #374151; margin-top: 28px; }
-.page { background: white; padding: 20px; margin-bottom: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
-.page > summary { cursor: pointer; font-size: 1.05em; font-weight: bold; color: #1f2937; padding: 4px 0 8px; user-select: none; }
-.page > summary:hover { color: #2563eb; }
-.trans-head { border-left: 3px solid #3b82f6; padding-left: 12px; margin: 12px 0; }
-p { line-height: 1.7; margin: 0 0 10px; text-align: justify; color: #111827; }
-.orig { color: #9ca3af; font-size: 0.88em; }
-.trans { color: #111827; }
-.ref-section h2 { color: #1f2937; border-top: 2px solid #d1d5db; margin-top: 24px; padding-top: 16px; padding-bottom: 6px; }
-.ref { color: #6b7280; font-size: 0.88em; margin-left: 16px; font-family: 'Courier New', monospace; line-height: 1.4; margin-bottom: 8px; }
-.meta { color: #6b7280; font-size: 0.82em; margin-bottom: 16px; padding-bottom: 8px; border-bottom: 1px solid #d1d5db; }
-.table-wrap { overflow-x: auto; margin: 12px 0; border-radius: 8px; border: 1px solid #d1d5db; }
-.table-wrap table { width: 100%; border-collapse: collapse; font-size: 0.88em; }
-.table-wrap th { background: #f3f4f6; border: 1px solid #d1d5db; padding: 8px 10px; color: #1f2937; }
-.table-wrap td { border: 1px solid #d1d5db; padding: 6px 10px; }
-.figure { margin: 20px 0; text-align: center; }
-.figure img { max-width: 100%; height: auto; border-radius: 6px; cursor: zoom-in; }
-.figure-caption { margin-top: 6px; font-style: italic; color: #6b7280; font-size: 0.85em; }
-.list-block { margin-left: 20px; line-height: 1.6; }
-.ref-link { color: #2563eb; font-weight: bold; }
-.table-wrap tbody tr:nth-child(even) td { background: #f9fafb; }
-.table-pre { white-space: pre-wrap; font-family: 'Courier New', monospace; font-size: 0.85em; margin: 8px 0; }
-.table-caption { font-style: italic; color: #6b7280; font-size: 0.85em; margin: 8px 0; }
-.toc { background: #f8fafc; border: 1px solid #e5e7eb; border-radius: 8px; padding: 14px 20px; margin-bottom: 20px; }
-.toc ul { list-style: none; margin: 6px 0 0; padding-left: 18px; }
-.toc > ul { padding-left: 0; }
-.toc a { color: #2563eb; text-decoration: none; }
-.toc a:hover { text-decoration: underline; }
-.btn-orig { background: #fff; border: 1px solid #d1d5db; color: #6b7280; border-radius: 6px; padding: 6px 12px; margin: 0 4px 12px 0; cursor: pointer; }
-.btn-orig:hover { color: #111827; }
-details.original-block { margin: 4px 0; }
-details.original-block summary { color: #9ca3af; font-size: 0.85em; cursor: pointer; }
-details.original-block summary:hover { color: #6b7280; }
-#lightbox { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.85); z-index: 999; align-items: center; justify-content: center; cursor: zoom-out; }
-#lightbox img { max-width: 92%; max-height: 92%; border-radius: 6px; }
-</style>
-"""
+_CSS_PALETTES = {
+    True: {
+        "BODY_FONT": "'Segoe UI', Arial, sans-serif", "BODY_MARGIN": "0; padding: 0", "BG": "#0f172a", "TEXT": "#e2e8f0", "H1_COLOR": "#60a5fa", "H1_BORDER": "#1e3a5f", "H3_COLOR": "#93c5fd",
+        "PAGE_BG": "#1e293b", "PAGE_BOX": "border: 1px solid #334155", "SUMMARY_COLOR": "#93c5fd", "SUMMARY_HOVER": "#60a5fa",
+        "ORIG_COLOR": "#64748b", "REF_COLOR": "#64748b", "META_COLOR": "#64748b", "TABLEWRAP_BORDER": "#334155", "TH_BG": "#0f172a", "TH_COLOR": "#60a5fa",
+        "TBODY_EVEN": "#16213a", "CAPTION_COLOR": "#94a3b8", "REFLINK_COLOR": "#60a5fa", "TOC_BG": "#1e293b", "TOC_BORDER": "#334155", "TOC_A": "#93c5fd",
+        "BTN_BG": "#1e293b", "BTN_BORDER": "#334155", "BTN_COLOR": "#94a3b8", "BTN_HOVER": "#e2e8f0", "DETAILS_COLOR": "#64748b", "DETAILS_HOVER": "#94a3b8", "CONTAINER_PAD": "padding: 24px;",
+    },
+    False: {
+        "BODY_FONT": "Arial, sans-serif", "BODY_MARGIN": "0; padding: 20px", "BG": "#f0f2f5", "TEXT": "#111827", "H1_COLOR": "#1f2937", "H1_BORDER": "#d1d5db", "H3_COLOR": "#374151",
+        "PAGE_BG": "white", "PAGE_BOX": "box-shadow: 0 2px 4px rgba(0,0,0,0.1);", "SUMMARY_COLOR": "#1f2937", "SUMMARY_HOVER": "#2563eb",
+        "ORIG_COLOR": "#9ca3af", "REF_COLOR": "#6b7280", "META_COLOR": "#6b7280", "TABLEWRAP_BORDER": "#d1d5db", "TH_BG": "#f3f4f6", "TH_COLOR": "#1f2937",
+        "TBODY_EVEN": "#f9fafb", "CAPTION_COLOR": "#6b7280", "REFLINK_COLOR": "#2563eb", "TOC_BG": "#f8fafc", "TOC_BORDER": "#e5e7eb", "TOC_A": "#2563eb",
+        "BTN_BG": "#fff", "BTN_BORDER": "#d1d5db", "BTN_COLOR": "#6b7280", "BTN_HOVER": "#111827", "DETAILS_COLOR": "#9ca3af", "DETAILS_HOVER": "#6b7280", "CONTAINER_PAD": "",
+    }
+}
 
+def build_css(dark: bool = True) -> str:
+    return _CSS_TEMPLATE.safe_substitute(_CSS_PALETTES[bool(dark)])
 
 def _reference_entries(block: Block) -> List[str]:
-    """Разбивает блок списка литературы на отдельные записи."""
     entries: List[List[str]] = []
     cur: List[str] = []
     for line in block.lines:
@@ -2321,12 +2205,10 @@ def _reference_entries(block: Block) -> List[str]:
         entries.append(cur)
     return [" ".join(e) for e in entries]
 
-
-# ИСПРАВЛЕНИЕ: убран неиспользуемый параметр in_ref
 def _block_html(block: Block) -> str:
     e = html_mod.escape
     bt = block.type
-    trans = block.translation or block.text
+    trans = block.translation if block.translation is not None else "[ПЕРЕВОД НЕ ПОЛУЧЕН]"
     orig = block.text
 
     def trans_html(text: str) -> str:
@@ -2400,7 +2282,6 @@ def _block_html(block: Block) -> str:
         return f'<p class="trans">{trans_html(trans)}</p><details class="original-block"><summary>Оригинал</summary><p class="orig">{orig_html(spans_text)}</p></details>\n'
     return f"<p>{trans_html(trans)}</p>\n"
 
-
 def render_spans(block):
     parts = []
     for line in block.lines:
@@ -2414,10 +2295,6 @@ def render_spans(block):
         parts.append("\n")
     return " ".join(parts)
 
-
-# =========================================================
-# ГЕНЕРАЦИЯ HTML
-# =========================================================
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html>
@@ -2472,7 +2349,6 @@ function closeLightbox() {
 </html>
 """
 
-
 def _build_toc(pages: List[Page]) -> List[Dict[str, str]]:
     toc = []
     idx = 0
@@ -2480,31 +2356,25 @@ def _build_toc(pages: List[Page]) -> List[Dict[str, str]]:
         for block in page.blocks:
             if block.type == "heading":
                 block._anchor = f"h{idx}"
-                toc.append({
-                    "anchor": f"h{idx}",
-                    "text": block.translation or block.text,
-                })
+                toc.append({"anchor": f"h{idx}", "text": block.translation or block.text})
                 idx += 1
     return toc
 
-
 def generate_html(pages: List[Page], title: str, output_path: str, dark: bool = True):
-    css = BLOCK_CSS if dark else BLOCK_CSS_LIGHT
+    css = build_css(dark)
     toc = _build_toc(pages)
     template = Template(HTML_TEMPLATE)
-    rendered = template.render(pages=pages, title=title, css=css, toc=toc,
-                               _block_html=_block_html)
+    rendered = template.render(pages=pages, title=title, css=css, toc=toc, _block_html=_block_html)
     with open(output_path, 'w', encoding='utf-8') as f:
         f.write(rendered)
-
 
 SUMMARY_TEMPLATE = """
 <!DOCTYPE html>
 <html>
 <head><meta charset="UTF-8"><title>{{ title }}</title>
 <style>
-body { font-family: Arial, sans-serif; margin: 40px; background: #f0f2f5; }
-.summary-container { background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); max-width: 900px; margin: 0 auto; }
+body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background: #f0f2f5; }
+.summary-container { background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); max-width: 95%; margin: 0 auto; }
 .summary-block { background: #e7f3ff; padding: 20px; border-radius: 8px; border: 1px solid #b3d7ff; margin-bottom: 20px; }
 .summary-block h2 { margin-top: 0; color: #004085; }
 .metadata { background: #f8f9fa; padding: 20px; border-radius: 8px; margin-bottom: 2em; border: 1px solid #dee2e6; }
@@ -2531,18 +2401,12 @@ body { font-family: Arial, sans-serif; margin: 40px; background: #f0f2f5; }
 {% endfor %}</details></div></body></html>
 """
 
-
 def generate_summary_html(pages: List[Page], summary_html: str, title: str, output_path: str):
     template = Template(SUMMARY_TEMPLATE)
-    rendered = template.render(pages=pages, title=title, summary_html=summary_html,
-                               render_spans=render_spans)
+    rendered = template.render(pages=pages, title=title, summary_html=summary_html, render_spans=render_spans)
     with open(output_path, 'w', encoding='utf-8') as f:
         f.write(rendered)
 
-
-# =========================================================
-# ОСНОВНОЙ ПРОЦЕСС
-# =========================================================
 def process_pdf(
     pdf_path: str,
     output_html: str,
@@ -2552,13 +2416,13 @@ def process_pdf(
     llama_model: Optional[str] = None,
     auto_find: bool = True,
     max_workers: int = 8,
-    timeout: int = 600,
+    timeout: int = BLOCK_TIMEOUT,
     quiet: bool = False,
     summary_mode: bool = False,
     summary_translator_type: str = "llama",
     translate_translator_type: str = "google",
     dark_html: bool = True,
-    refine: bool = False,
+    sprut_model: Optional[str] = None,
 ) -> Dict[str, Any]:
 
     timings: Dict[str, float] = {}
@@ -2584,8 +2448,7 @@ def process_pdf(
             try:
                 span_tables, text_blocks = _find_span_table_blocks(text_blocks)
                 if span_tables and table_blocks:
-                    covered = [i for i, tb in enumerate(table_blocks)
-                               if any(_rect_gap(tb.bbox, st.bbox) <= 5 for st in span_tables)]
+                    covered = [i for i, tb in enumerate(table_blocks) if any(_rect_gap(tb.bbox, st.bbox) <= 5 for st in span_tables)]
                     for i in reversed(covered):
                         table_blocks.pop(i)
                     total_tables -= len(covered)
@@ -2601,33 +2464,23 @@ def process_pdf(
                 logger.warning(f"Ошибка извлечения изображений: {e}")
             try:
                 used_bboxes = [fb.bbox for fb in figure_blocks]
-                vector_blocks, text_blocks = extract_vector_figures(
-                    fitz_page, page.num, text_blocks,
-                    used_bboxes=used_bboxes, table_bboxes=table_bboxes)
+                vector_blocks, text_blocks = extract_vector_figures(fitz_page, page.num, text_blocks, used_bboxes=used_bboxes, table_bboxes=table_bboxes)
                 figure_blocks.extend(vector_blocks)
                 total_images += len(vector_blocks)
             except Exception as e:
                 logger.warning(f"Ошибка извлечения векторных фигур: {e}")
             page.blocks = non_text + text_blocks + table_blocks + figure_blocks
-        # Проверка наличия текста
-        total_text = ""
-        for page in pages:
-            for block in page.blocks:
-                total_text += block.text
+
+        total_text = "".join(block.text for page in pages for block in page.blocks)
         if len(total_text.strip()) < 10:
             logger.error("❌ В PDF не найден текст (возможно, файл состоит только из изображений или отсканирован).")
-            sys.exit(1)            
+            sys.exit(1)
         doc.close()
     logger.info(f"   Извлечено {len(pages)} стр., {total_images} изобр., {total_tables} табл.")
 
     with stage_timer("2. Классификация", timings):
         for page in pages:
-            all_sizes = []
-            for block in page.blocks:
-                if block.type in ("paragraph", "heading", "metadata"):
-                    for line in block.lines:
-                        for span in line.spans:
-                            all_sizes.append(span.size)
+            all_sizes = [span.size for block in page.blocks if block.type in ("paragraph", "heading", "metadata") for line in block.lines for span in line.spans]
             avg_size = sum(all_sizes) / len(all_sizes) if all_sizes else 12.0
             for block in page.blocks:
                 if block.type == "text":
@@ -2652,26 +2505,14 @@ def process_pdf(
                         block.type = "reference"
         for page in pages:
             table_blocks_page = [b for b in page.blocks if b.type == "table"]
-            if table_blocks_page:
-                mark_table_blocks(page.blocks, table_blocks_page)
-            heuristic_table_blocks(page.blocks)
-            mark_table_regions(page.blocks)
-            page.blocks = [b for b in page.blocks
-                           if b is not None
-                           and b.type != "empty"
-                           and not (b.type == "table" and b.table_data is None and not b.text.strip())]
+            page.blocks = consolidate_tables(page.blocks, table_blocks_page)
 
     if summary_mode:
         with stage_timer("4. Генерация реферата", timings):
             logger.info("📝 Режим реферата...")
             if summary_translator_type == "google":
-                logger.warning("   Google Translate не поддерживает генерацию. Переключаю на llama.")
                 summary_translator_type = "llama"
-            result = generate_summary(
-                pages, summary_translator_type=summary_translator_type,
-                translate_translator_type=translate_translator_type, lang=lang,
-                llama_url=llama_url, llama_model=llama_model, auto_find=auto_find, quiet=quiet,
-            )
+            result = generate_summary(pages, summary_translator_type=summary_translator_type, translate_translator_type=translate_translator_type, lang=lang, llama_url=llama_url, llama_model=llama_model, auto_find=auto_find, sprut_model=sprut_model, quiet=quiet)
             summary_html = result["summary_html"]
             gen_stats = result["stats"]
 
@@ -2679,97 +2520,62 @@ def process_pdf(
             generate_summary_html(pages, summary_html, f"Реферат: {os.path.basename(pdf_path)}", output_html)
             logger.info(f"   HTML сохранён: {output_html}")
 
-        stats = {
-            "chunks": gen_stats.get("chunks", 0),
-            "tokens": gen_stats.get("tokens", 0),
-            "speed": gen_stats.get("speed", 0),
-            "model": gen_stats.get("model", ""),
-            "time": gen_stats.get("time", 0),
-            "summary_mode": True,
-            "timings": timings,
-        }
-        return {"stats": stats, "pages": len(pages), "images": total_images, "tables": total_tables, "summary": True}
+        return {"stats": {"chunks": gen_stats.get("chunks", 0), "tokens": gen_stats.get("tokens", 0), "speed": gen_stats.get("speed", 0), "model": gen_stats.get("model", ""), "time": gen_stats.get("time", 0), "summary_mode": True, "timings": timings}, "pages": len(pages), "images": total_images, "tables": total_tables, "summary": True}
 
     with stage_timer("4. Перевод", timings):
         logger.info(f"🌐 Перевод на {lang} ({translator_type})...")
         try:
-            translator, fallback = create_translator(
-                translator_type, lang, llama_url=llama_url,
-                llama_model=llama_model, auto_find=auto_find,
-            )
+            translator, fallback = create_translator(translator_type, lang, llama_url=llama_url, llama_model=llama_model, auto_find=auto_find, sprut_model=sprut_model)
         except RuntimeError as e:
-            logger.error(f"   Ошибка: {e}. Fallback на Google Translate...")
-            translator = GoogleTranslator(lang)
-            fallback = None
+            logger.error(f"   Не удалось инициализировать переводчик '{translator_type}': {e}")
+            return {"stats": {"error": str(e)}, "pages": 0, "images": 0, "tables": 0}
 
-        logger.info(f"   Переводчик: {translator.name}")
-        if fallback:
-            logger.info(f"   Fallback: {fallback.name}")
-
-        effective_workers = max_workers
-        if translator_type == "llama":
-            effective_workers = min(max_workers, 3)
-            if not quiet:
-                logger.info(f"   Локальный сервер: ограничено до {effective_workers} воркеров")
+        effective_workers = 1 if translator_type == "llama" else max_workers
+        if translator_type == "llama" and not quiet:
+            logger.info(f"   Локальный сервер: ограничено до 1 воркера (параллельные запросы вызывают зацикливание/галлюцинации)")
 
         pipeline = TranslationPipeline(
             translator=translator, fallback=fallback,
             max_workers=effective_workers, timeout=timeout,
             is_local=(translator_type == "llama"), translator_type=translator_type,
-            refine=refine,
         )
 
-        all_blocks = []
-        for page in pages:
-            all_blocks.extend(page.blocks)
+        all_blocks = [block for page in pages for block in page.blocks]
         pipeline.translate_blocks(all_blocks, lang, quiet=quiet)
 
     with stage_timer("5. HTML", timings):
         generate_html(pages, f"Перевод: {os.path.basename(pdf_path)}", output_html, dark=dark_html)
         logger.info(f"   HTML сохранён: {output_html}")
 
-    return {
-        "stats": {**pipeline.stats, "timings": timings},
-        "pages": len(pages), "images": total_images, "tables": total_tables,
-    }
+    return {"stats": {**pipeline.stats, "timings": timings}, "pages": len(pages), "images": total_images, "tables": total_tables}
 
-
-# =========================================================
-# CLI
-# =========================================================
 def main():
     parser = argparse.ArgumentParser(description="PDF Translator — единый скрипт")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("input", help="Входной PDF файл")
     parser.add_argument("-l", "--lang", default="ru", help="Целевой язык (по умолчанию: ru)")
-    parser.add_argument("-t", "--translator", default="google",
-                        choices=["google", "llama", "openrouter"],
-                        help="Переводчик (по умолчанию: google)")
+    parser.add_argument("-t", "--translator", default="google", choices=["google", "llama", "openrouter", "sprut"], help="Переводчик (по умолчанию: google)")
     parser.add_argument("--llama-url", default="http://localhost:8080/v1", help="URL llama.cpp сервера")
     parser.add_argument("--llama-model", help="Ожидаемое имя модели")
+    parser.add_argument("--sprut-model", default=os.getenv("SPRUT_MODEL"), help="Модель для SprutDock (например, z-ai/glm-5.2:free)")
     parser.add_argument("--no-auto-find", action="store_true", help="Отключить автоматический поиск сервера")
     parser.add_argument("--summary", action="store_true", help="Режим реферата")
-    parser.add_argument("--summary-translator", choices=["google", "llama", "openrouter"], default="llama",
-                        help="Генератор реферата (по умолчанию: llama)")
-    parser.add_argument("--summary-lang-translator", choices=["google", "llama", "openrouter"], default="google",
-                        help="Переводчик реферата (по умолчанию: google)")
-    parser.add_argument("--workers", type=int, default=min(8, (os.cpu_count() or 1) * 2),
-                        help="Число воркеров")
-    parser.add_argument("--task-timeout", type=int, default=600, help="Таймаут перевода (сек)")
-    parser.add_argument("--refine", action="store_true",
-                        help="Итеративный рефайн перевода (для локальных LLM)")
-    parser.add_argument("--dark-html", action="store_true", default=True,
-                        help="Тёмная тема HTML (по умолчанию: вкл)")
+    parser.add_argument("--summary-translator", choices=["google", "llama", "openrouter", "sprut"], default="llama", help="Генератор реферата (по умолчанию: llama)")
+    parser.add_argument("--summary-lang-translator", choices=["google", "llama", "openrouter", "sprut"], default="google", help="Переводчик реферата (по умолчанию: google)")
+    parser.add_argument("--workers", type=int, default=min(8, (os.cpu_count() or 1) * 2), help="Число воркеров")
+    parser.add_argument("--block-timeout", type=int, default=BLOCK_TIMEOUT, help="Максимум секунд на один блок")
+    parser.add_argument("--dark-html", action="store_true", default=True, help="Тёмная тема HTML (по умолчанию: вкл)")
     parser.add_argument("--light-html", action="store_true", help="Светлая тема HTML")
     parser.add_argument("-q", "--quiet", action="store_true", help="Тихий режим")
     parser.add_argument("-v", "--verbose", action="store_true", help="Подробный вывод")
     args = parser.parse_args()
 
     if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
+        logger.setLevel(logging.DEBUG)
+        for h in logger.handlers:
+            h.setLevel(logging.DEBUG)
 
     dark_html = not args.light_html
-
     input_base = os.path.splitext(args.input)[0]
     output_html = f"{input_base}_summary.html" if args.summary else f"{input_base}_translate.html"
 
@@ -2779,21 +2585,11 @@ def main():
 
     try:
         result = process_pdf(
-            pdf_path=args.input,
-            output_html=output_html,
-            lang=args.lang,
-            translator_type=args.translator,
-            llama_url=args.llama_url,
-            llama_model=args.llama_model,
-            auto_find=not args.no_auto_find,
-            max_workers=args.workers,
-            timeout=args.task_timeout,
-            quiet=args.quiet,
-            summary_mode=args.summary,
-            summary_translator_type=args.summary_translator,
-            translate_translator_type=args.summary_lang_translator,
-            dark_html=dark_html,
-            refine=args.refine,
+            pdf_path=args.input, output_html=output_html, lang=args.lang, translator_type=args.translator,
+            llama_url=args.llama_url, llama_model=args.llama_model, auto_find=not args.no_auto_find,
+            max_workers=args.workers, timeout=args.block_timeout, quiet=args.quiet, summary_mode=args.summary,
+            summary_translator_type=args.summary_translator, translate_translator_type=args.summary_lang_translator,
+            dark_html=dark_html, sprut_model=args.sprut_model,
         )
 
         stats = result["stats"]
@@ -2801,20 +2597,18 @@ def main():
         if stats.get("summary_mode", False):
             logger.info("📊 СТАТИСТИКА ГЕНЕРАЦИИ РЕФЕРАТА:")
             logger.info(f"   ✓ Обработано чанков: {stats.get('chunks', 0)}")
-            if stats.get("tokens", 0) > 0:
-                logger.info(f"   📝 Сгенерировано токенов (приблиз.): {stats['tokens']}")
-            if stats.get("speed", 0) > 0:
-                logger.info(f"   ⚡ Скорость: {stats['speed']:.1f} токенов/сек")
-            if stats.get("model"):
-                logger.info(f"   🤖 Модель: {stats['model']}")
-            if stats.get("time", 0) > 0:
-                logger.info(f"   ⏱️ Время генерации: {_format_time(stats['time'])}")
+            if stats.get("tokens", 0) > 0: logger.info(f"   📝 Сгенерировано токенов (приблиз.): {stats['tokens']}")
+            if stats.get("speed", 0) > 0: logger.info(f"   ⚡ Скорость: {stats['speed']:.1f} токенов/сек")
+            if stats.get("model"): logger.info(f"   🤖 Модель: {stats['model']}")
+            if stats.get("time", 0) > 0: logger.info(f"   ⏱️ Время генерации: {_format_time(stats['time'])}")
         else:
             logger.info("📊 СТАТИСТИКА ПЕРЕВОДА:")
-            logger.info(f"   ✓ Переведено: {stats['success']}")
-            logger.info(f"   ⚡ Из кэша:   {stats['cached']}")
-            logger.info(f"   ⊘ Пропущено:  {stats['skipped']}")
-            logger.info(f"   ✗ Ошибок:     {stats['failed']}")
+            logger.info(f"   ✓ Переведено: {stats.get('success', 0)}")
+            logger.info(f"   ⚡ Из кэша:   {stats.get('cached', 0)}")
+            logger.info(f"   ⊘ Пропущено:  {stats.get('skipped', 0)}")
+            logger.info(f"   ✗ Ошибок:     {stats.get('failed', 0)}")
+            if stats.get("error"): logger.error(f"   Причина: {stats['error']}")
+
         timings = stats.get("timings", {})
         if timings:
             logger.info("⏱️  ПРОФИЛИРОВАНИЕ:")
@@ -2831,7 +2625,6 @@ def main():
         import traceback
         traceback.print_exc()
         sys.exit(1)
-
 
 if __name__ == "__main__":
     main()
