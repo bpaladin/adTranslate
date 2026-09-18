@@ -1,6 +1,6 @@
-# PDF Translator v1.0
+# PDF Translator v1.2
 
-Параллельный перевод PDF-документов на другой язык с сохранением форматирования, изображений и таблиц. Поддерживает режим перевода и генерации рефератов.
+Параллельный перевод PDF-документов на другой язык с сохранением форматирования, изображений и таблиц. Поддерживает режим перевода, генерации рефератов и конвертации в HTML без перевода.
 
 ## Установка
 
@@ -8,7 +8,7 @@
 pip install -r requirements.txt
 ```
 
-Зависимости: `pymupdf`, `openai`, `requests`, `jinja2`, `tqdm`, `markdown`, `cachetools`.
+Зависимости: `pymupdf`, `pdfplumber`, `openai`, `requests`, `jinja2`, `tqdm`, `markdown`, `cachetools`. Опционально: `pyphen` (точная детекция переносов строк, словари RU/EN).
 
 ## Быстрый старт
 
@@ -24,9 +24,12 @@ python main.py paper.pdf -t llama
 
 # Реферат статьи → файл paper_summary.html
 python main.py paper.pdf --summary
+
+# Конвертация в HTML без перевода → файл paper_raw.html
+python main.py paper.pdf --raw-html
 ```
 
-Выходной HTML-файл создаётся автоматически рядом с входным: `*_translate.html` (перевод) или `*_summary.html` (реферат).
+Выходной HTML-файл создаётся автоматически рядом с входным: `*_translate.html` (перевод), `*_summary.html` (реферат) или `*_raw.html` (оригинал). Имя можно переопределить через `-o/--output`.
 
 ## CLI
 
@@ -43,6 +46,9 @@ python main.py <input.pdf> [опции]
 | `--llama-model` | — | Ожидаемое имя модели на сервере |
 | `--no-auto-find` | — | Отключить авто-поиск llama-сервера |
 | `--summary` | — | Режим реферата |
+| `--raw-html` | — | Сохранение в HTML без перевода (pdf2html-алгоритм) |
+| `-o, --output` | — | Выходной HTML файл (по умолчанию рядом с PDF) |
+| `--debug-text` | — | Отладка извлечения текста (bbox/quality в DEBUG-лог) |
 | `--summary-translator` | `llama` | Генератор реферата: `google`, `llama`, `openrouter` |
 | `--summary-lang-translator` | `google` | Переводчик готового реферата |
 | `--workers` | `min(8, cpu*2)` | Число параллельных воркеров |
@@ -51,7 +57,7 @@ python main.py <input.pdf> [опции]
 | `--dark-html` | вкл | Тёмная тема HTML |
 | `--light-html` | — | Светлая тема HTML |
 | `-q, --quiet` | — | Тихий режим |
-| `-v, --verbose` | — | Подробный вывод (DEBUG) |
+| `-v, --verbose` | — | Подробный вывод (DEBUG, включая профилирование этапов) |
 
 ### Переменные окружения
 
@@ -110,6 +116,30 @@ python main.py paper.pdf -t openrouter --summary --summary-lang-translator googl
 1. LLM генерирует реферат **на английском** (чанки по 6000 символов)
 2. Полученный реферат переводится на целевой язык
 
+## Конвертация PDF → HTML (без перевода)
+
+```bash
+# Один файл
+python main.py paper.pdf --raw-html
+
+# Все PDF каталога ./pdfs (Linux/macOS)
+./batch_html.sh [КАТАЛОГ] [--light] [--debug-text]
+
+# Все PDF каталога .\pdfs (Windows)
+batch_html.bat [КАТАЛОГ]
+```
+
+По умолчанию батч-скрипты берут каталог `./pdfs` (один уровень, `*.pdf`), выход — `*_raw.html` рядом с каждым PDF.
+
+Алгоритм анализа текста портирован из эталонного `pdf2html.py` в модульную версию (`modules/text_extraction.py`, используется `main.py --raw-html` и всем пайплайном):
+- единый проход `page.get_text("dict")`, без `get_text("text", clip=...)` (источник перемешивания символов в двухколоночных PDF, таблицах и подписях);
+- нормализация пробелов без разрушения Unicode, soft hyphen вырезается, обычные дефисы сохраняются;
+- детекция переносов на уровне слов: Unicode-дефисы (U+2010…U+2212), словари `pyphen` + `data/words_*.txt`, compound-префиксы, защита цифр/пунктуации/аббревиатур;
+- сшивка переносов через границу блоков (`представ-` + `лений`);
+- удаление текста под рисунками построчно (центр/перекрытие/метки у кромки), подписи `Figure/Рис./Table N` защищены от удаления;
+- валидация таблиц (отсев абзацных совпадений >70%, возврат ложных в текст, дедуплика pdfplumber/span);
+- детекция повторяющихся колонтитулов по канонической форме (номера страниц срезаются), голые номера страниц помечаются как `metadata`.
+
 ## HTML-отчёт
 
 - Тёмная и светлая темы
@@ -122,6 +152,10 @@ python main.py paper.pdf -t openrouter --summary --summary-lang-translator googl
 ## Батч-обработка
 
 ```bash
+# Пакетная конвертация всех PDF в HTML (без перевода, каталог ./pdfs)
+./batch_html.sh
+batch_html.bat
+
 # Пакетный перевод всех PDF в каталоге
 ./batch_translator.sh
 
@@ -129,7 +163,16 @@ python main.py paper.pdf -t openrouter --summary --summary-lang-translator googl
 ./batch_summary.sh [КАТАЛОГ] [РЕЖИМ] [МОДЕЛЬ]
 ```
 
+## Структура модулей (извлечение)
+
+```
+modules/text_extraction.py   # алгоритм из pdf2html.py: dict-проход, переносы, merge, line-level figure-фильтр
+modules/pipeline.py          # общий этап извлечения: текст → таблицы (валидация) → фигуры (bake gap=35) → HTML
+modules/models.py            # Block.text_override (склеенный текст) + font_size/flags/color/starts_with_bold
+```
+
 ## Логирование
 
 - **Консоль:** `INFO` и выше (`-v` — `DEBUG`, `-q` — `WARNING`)
+- Профилирование этапов скрыто по умолчанию, показывается только с `-v/--verbose`
 - **Файл:** `pdf_translator.log` (все сообщения, `DEBUG`+)

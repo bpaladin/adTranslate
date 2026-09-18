@@ -68,6 +68,7 @@ analyzer_session.json
 *.db
 *.pdf
 *.7z
+*.zip
 *.json
 *.db
 translation_cache.*

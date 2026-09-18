@@ -1,6 +1,6 @@
-# PDF Translator v1.1
+# PDF Translator v1.2
 
-Параллельный перевод PDF-документов на другой язык с сохранением форматирования, изображений и таблиц. Поддерживает режим перевода и генерации рефератов.
+Параллельный перевод PDF-документов на другой язык с сохранением форматирования, изображений и таблиц. Поддерживает режим перевода, генерации рефератов и конвертации в HTML без перевода.
 
 ## Установка
 
@@ -24,9 +24,12 @@ python main.py paper.pdf -t llama
 
 # Реферат статьи
 python main.py paper.pdf --summary
+
+# Конвертация в HTML без перевода (алгоритм pdf2html.py)
+python main.py paper.pdf --raw-html
 ```
 
-Выходной HTML-файл создаётся автоматически: `*_translate.html` или `*_summary.html`.
+Выходной HTML-файл создаётся автоматически: `*_translate.html`, `*_summary.html` или `*_raw.html` (`-o` переопределяет имя).
 
 ## CLI
 
@@ -50,7 +53,7 @@ python main.py <input.pdf> [опции]
 | `--dark-html` | вкл | Тёмная тема HTML |
 | `--light-html` | — | Светлая тема HTML |
 | `-q, --quiet` | — | Тихий режим |
-| `-v, --verbose` | — | Подробный вывод |
+| `-v, --verbose` | — | Подробный вывод (включая профилирование этапов) |
 
 ### Переменные окружения
 
@@ -202,9 +205,23 @@ Block -> Line -> Span
 - Подсветка ссылок на литературу
 - Таблицы рендерятся как HTML-таблицы, фигуры -- как изображения
 
+## Конвертация PDF → HTML (без перевода, алгоритм pdf2html.py)
+
+```bash
+python main.py paper.pdf --raw-html
+./batch_html.sh [КАТАЛОГ] [--light] [--debug-text]
+batch_html.bat [КАТАЛОГ]
+```
+
+Батч-скрипты по умолчанию берут `./pdfs`, выход — `*_raw.html` рядом с PDF. Модульная реализация (`modules/text_extraction.py` + `modules/pipeline.py`) повторяет эталон `pdf2html.py`: единый `get_text("dict")`-проход без `clip`-переизвлечения, Unicode-дефисы + словари `pyphen`/`data/words_*.txt`, сшивка переносов через границу блоков, построчное запекание текста под рисунками с защитой подписей, валидация таблиц, канонические колонтитулы. Флаги: `-o/--output`, `--debug-text`, `--light-html`.
+
 ## Батч-обработка
 
 ```bash
+# Пакетная конвертация всех PDF в HTML (без перевода)
+./batch_html.sh
+batch_html.bat
+
 # Пакетный перевод всех PDF в каталоге
 ./batch_translator.sh
 
@@ -219,6 +236,7 @@ Block -> Line -> Span
 ## Новая структура проекта
 adTranslate/
 ├── main.py                     # Точка входа (CLI)
+├── batch_html.sh / batch_html.bat # Пакетная конвертация PDF → HTML (каталог pdfs)
 ├── config/
 │   ├── settings.json           # Настройки
 │   └── translation_validation.log
@@ -227,7 +245,8 @@ adTranslate/
     ├── logging_setup.py        # Цветное логирование, validation_logger
     ├── config.py               # Загрузка настроек, API-ключи
     ├── utils.py                # STOP_EVENT, normalize_text, таймеры
-    ├── models.py               # Span, Line, Block, Page, BlockMetrics
+    ├── models.py               # Span, Line, Block (+text_override/font_size/flags), Page
+    ├── text_extraction.py      # Текст по pdf2html.py: dict-проход, переносы, merge, figure-фильтр
     ├── classifier.py           # BlockClassifier
     ├── pdf_extraction.py       # PDFExtractor
     ├── table_detection.py      # Таблицы (PyMuPDF + эвристики)

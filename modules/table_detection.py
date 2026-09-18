@@ -69,6 +69,37 @@ def _fix_reversed_table(rows: List[List[str]]) -> List[List[str]]:
     return fixed_rows
 
 
+_REF_CELL_RE = re.compile(
+    r'(?:DOI:|Vol\.|Pp?\.\s|Art\.\s|http|//\s*\w+\.\w+|р\.\s|Том\s|№\s|С\.\s|\d{4}\.\s|'
+    r'\w+\.\s+\w+\.\s*\d{4}|Ser\.\s|pp\.\s|pp\.,|pp\.)', re.I)
+_REF_STYLE_RE = re.compile(
+    r'(?:[A-Z][a-z]+\s+[A-Z]\.[A-Z]?\.|[A-Z][a-z]+\s+[A-Z]\.?\s+[A-Z][a-z]+)')
+_REF_NUM_RE = re.compile(r'^\d+\.\s+[A-Z]')
+
+
+def _is_reference_table(rows: List[List[str]]) -> bool:
+    """Check if table cells contain reference-like entries (journal citations)."""
+    if not rows:
+        return False
+    ref_signals = 0
+    total_cells = 0
+    for row in rows:
+        for cell in row:
+            cell = cell.strip()
+            if not cell:
+                continue
+            total_cells += 1
+            if _REF_CELL_RE.search(cell):
+                ref_signals += 1
+            if _REF_STYLE_RE.search(cell):
+                ref_signals += 1
+            if _REF_NUM_RE.match(cell):
+                ref_signals += 1
+    if total_cells == 0:
+        return False
+    return ref_signals / total_cells > 0.3
+
+
 def extract_tables(page, page_num: int) -> List[Block]:
     """Детекция таблиц через pdfplumber. Принимает pdfplumber Page."""
     table_blocks: List[Block] = []
@@ -92,6 +123,8 @@ def extract_tables(page, page_num: int) -> List[Block]:
             if not rows or all(not c for row in rows for c in row):
                 continue
             if len(rows) < 2 or len(rows[0]) < 2:
+                continue
+            if _is_reference_table(rows):
                 continue
             rows = _fix_reversed_table(rows)
             tab_rect = tuple(tab.bbox)
@@ -264,6 +297,11 @@ def _heuristic_table_data(text: str) -> Optional[List[List[str]]]:
     lines = [ln for ln in text.split('\n') if ln.strip()]
     if len(lines) < 2:
         return None
+    # Прозаический абзац с justification-пробелами — не таблица:
+    # длинные строки без пунктуации на концах.
+    avg_len = sum(len(ln) for ln in lines) / len(lines)
+    if avg_len > 90 and not any(re.search(r'[.!?;]\s*$', ln) for ln in lines):
+        return None
     ends_with_punct = sum(1 for ln in lines if re.search(r'[.!?;]\s*$', ln))
     if ends_with_punct > len(lines) * 0.4:
         return None
@@ -356,7 +394,7 @@ def _detect_table_by_content(blocks: List[Block]) -> List[Block]:
 def _cluster_columns_by_x(blocks: List[Block], eps: float = 15.0, min_samples: int = 2) -> List[float]:
     all_x = []
     for b in blocks:
-        if b.type in ("table", "figure", "empty"):
+        if b.type in ("table", "figure", "empty", "reference", "reference_heading", "metadata"):
             continue
         for ln in b.lines:
             line_text = "".join(s.text for s in ln.spans).strip()
@@ -378,11 +416,16 @@ def _cluster_columns_by_x(blocks: List[Block], eps: float = 15.0, min_samples: i
     for c in clusters:
         if len(c) >= min_samples:
             result.append(sum(c) / len(c))
-    return sorted(result)
+    if len(result) < 2:
+        return result
+    filtered = []
+    for i, col in enumerate(result):
+        if i == 0 or col - filtered[-1] > 60:
+            filtered.append(col)
+    return filtered
 
 
 def consolidate_tables(blocks: List[Block], found_table_blocks: Optional[List[Block]] = None) -> List[Block]:
-    page_columns = _cluster_columns_by_x(blocks)
     if found_table_blocks:
         for block in blocks:
             if block.type == "table":
@@ -393,32 +436,39 @@ def consolidate_tables(blocks: List[Block], found_table_blocks: Optional[List[Bl
                         block.type = "table"
                         break
     for b in blocks:
-        if b.type in ("table", "figure"):
+        if b.type in ("table", "figure", "reference", "reference_heading", "metadata"):
             continue
         rows = _heuristic_table_data(b.text)
         if rows:
             b.type = "table"
             b.table_data = rows
             continue
-        if page_columns and len(page_columns) >= 2 and b.type == "text":
-            block_xs = []
+        if b.type in ("text", "paragraph") and len(b.lines) >= 2:
+            # Таблица без линеек и подписи: >=2 строк с широким gutter
+            # (>=15pt) между спанами — разделителем колонок. У прозы
+            # межспановые зазоры — обычные межсловные пробелы (замер по
+            # корпусу: макс. ~8pt), даже в двухколоночной вёрстке.
+            gutter_lines = 0
             for ln in b.lines:
-                for s in ln.spans:
-                    if s.text.strip():
-                        block_xs.append(s.bbox[0])
-            if block_xs:
-                matched = sum(1 for x in block_xs if any(abs(x - c) <= 12 for c in page_columns))
-                if matched / len(block_xs) >= 0.6 and len(b.lines) >= 2:
-                    b.type = "table"
+                xs = sorted(
+                    (s.bbox[0], s.bbox[2])
+                    for s in ln.spans if s.text.strip()
+                )
+                if any(nxt - prev_x1 >= 15.0 for (_, prev_x1), (nxt, _)
+                       in zip(xs, xs[1:])):
+                    gutter_lines += 1
+            if gutter_lines >= 2:
+                b.type = "table"
     content_table_blocks = _detect_table_by_content(blocks)
     for b in content_table_blocks:
-        if b.type not in ("table", "figure"):
-            rows = _heuristic_table_data(b.text)
-            if rows:
-                b.type = "table"
-                b.table_data = rows
-            elif b.type == "text":
-                b.type = "table"
+        if b.type not in ("text", "paragraph"):
+            continue
+        rows = _heuristic_table_data(b.text)
+        if rows:
+            b.type = "table"
+            b.table_data = rows
+        elif b.type == "text":
+            b.type = "table"
     i = 0
     n = len(blocks)
     while i < n:

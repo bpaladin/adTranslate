@@ -91,12 +91,12 @@ def interactive_mode():
 
     stats = result.get("stats", {})
     timings = stats.get("timings", {})
-    logger.info("=" * 60)
+    logger.debug("=" * 60)
     if timings:
-        logger.info("  ПРОФИЛИРОВАНИЕ:")
+        logger.debug("  ПРОФИЛИРОВАНИЕ:")
         for stage, t in timings.items():
-            logger.info(f"   {stage}: {_format_time(t)}")
-    logger.info("=" * 60)
+            logger.debug(f"   {stage}: {_format_time(t)}")
+    logger.debug("=" * 60)
     logger.info(f" Готово: {output_html}")
 
 
@@ -126,11 +126,13 @@ def main():
     parser.add_argument("--block-timeout", type=int, default=BLOCK_TIMEOUT, help="Максимум секунд на один блок")
     parser.add_argument("--dark-html", action="store_true", default=True, help="Тёмная тема HTML (по умолчанию: вкл)")
     parser.add_argument("--light-html", action="store_true", help="Светлая тема HTML")
+    parser.add_argument("-o", "--output", help="Выходной HTML файл (по умолчанию: рядом с PDF)")
+    parser.add_argument("--debug-text", action="store_true", help="Отладка извлечения текста: bbox, quality и итоговые строки")
     parser.add_argument("-q", "--quiet", action="store_true", help="Тихий режим")
     parser.add_argument("-v", "--verbose", action="store_true", help="Подробный вывод")
     args = parser.parse_args()
 
-    if args.verbose:
+    if args.verbose or args.debug_text:
         logger.setLevel(logging.DEBUG)
         for h in logger.handlers:
             h.setLevel(logging.DEBUG)
@@ -138,7 +140,9 @@ def main():
     dark_html = not args.light_html
     input_base = os.path.splitext(args.input)[0]
 
-    if args.raw_html:
+    if args.output:
+        output_html = args.output
+    elif args.raw_html:
         output_html = f"{input_base}_raw.html"
     elif args.summary:
         output_html = f"{input_base}_summary.html"
@@ -156,6 +160,7 @@ def main():
         if args.raw_html:
             result = process_pdf_raw(
                 pdf_path=args.input, output_html=output_html, dark_html=dark_html,
+                debug_text=args.debug_text,
             )
         else:
             result = process_pdf(
@@ -164,15 +169,16 @@ def main():
                 max_workers=args.workers, timeout=args.block_timeout, quiet=args.quiet, summary_mode=args.summary,
                 summary_translator_type=args.summary_translator, translate_translator_type=args.summary_lang_translator,
                 dark_html=dark_html, sprut_model=args.sprut_model,
+                debug_text=args.debug_text,
             )
 
         stats = result["stats"]
-        logger.info("=" * 60)
+        logger.debug("=" * 60)
         timings = stats.get("timings", {})
         if timings:
-            logger.info("  ПРОФИЛИРОВАНИЕ:")
+            logger.debug("  ПРОФИЛИРОВАНИЕ:")
             for stage, t in timings.items():
-                logger.info(f"   {stage}: {_format_time(t)}")
+                logger.debug(f"   {stage}: {_format_time(t)}")
         elif stats.get("summary_mode", False):
             logger.info(" СТАТИСТИКА ГЕНЕРАЦИИ РЕФЕРАТА:")
             logger.info(f"    Обработано чанков: {stats.get('chunks', 0)}")

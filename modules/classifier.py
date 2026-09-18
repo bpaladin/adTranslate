@@ -32,6 +32,17 @@ class BlockClassifier:
             return "empty"
 
         word_count = len(m.text.split())
+        stripped = m.text.strip()
+
+        # Одно слово заглавными — заголовок (требование: одно слово капсом → <h3>)
+        # Примеры: INTRODUCTION, METHODS, RESULTS, ВВЕДЕНИЕ, ABSTRACT
+        # Фильтр len>=3 чтобы отсечь фрагменты "NE", "IE" от разбитых блоков
+        # Исключаем reference-ключевые слова (REFERENCES, ЛИТЕРАТУРА и т.д.)
+        if word_count == 1 and m.all_upper and len(stripped) >= 3:
+            if not REF_HEADING_RE.match(m.text):
+                core = stripped.rstrip(':.')
+                if len(core) >= 3 and re.fullmatch(r'[A-ZА-ЯЁ0-9\-]+', core) and re.search(r'[A-ZА-ЯЁ]', core):
+                    return "heading"
 
         # Эвристика таблицы по тексту (колонки через табуляцию / 3+ пробела)
         if self._is_likely_table(m.text):

@@ -76,7 +76,7 @@ _FORMULA_TOKEN_RE = re.compile(
     r"(?:"
     r"[A-Za-zА-Яа-я](?:[_^][\d{}()+\-])?"  # variable with optional subscript/superscript
     r"|"
-    r"[∫∑∏∂√∞∇±×÷≠≤≥≈∝∈∉⊂⊃∪∩∧∨¬αβγδεζηθικλμνξοπρστυφχψω]"
+    r"[∫∑∏∂√∞∇±×÷≠≤≥≈∝∈∉⊂⊃∪∩∧∨¬αβγδεζηθικλμνξοπρστυφχψωΩ]"
     r")"
     r"(?:\s*[=<>≤≥≥≠±+*/÷^]\s*(?:\([^)]+\)|\{[^}]+\}|[A-Za-zА-Яа-я0-9∫∑∏∂√∞∇±×÷≠≤≥≈∝]+(?:[_^][\d{}()+\-])*))*",
     re.UNICODE,
@@ -93,7 +93,25 @@ _MATH_EXPR_RE = re.compile(
     r")",
     re.UNICODE,
 )
-_SPECIAL_MATH_CHARS = set("∫∑∏∂√∞∇αβγδεζηθικλμνξοπρστυφχψω")
+_MATH_EXPR_RE2 = re.compile(
+    r"(?:"
+    r"(?:\d+(?:\.\d+)?)\s*[/÷]\s*(?:\d+(?:\.\d+)?|[A-Za-zА-Яа-я](?:[_^][\d{}()+\-])*)"
+    r"|"
+    r"[A-Za-zА-Яа-я](?:[_^][\d{}()+\-])*\s*[/÷]\s*[A-Za-zА-Яа-я0-9](?:[_^][\d{}()+\-])*"
+    r"|"
+    r"(?:\([^)]+\)|\{[^}]+\})\s*[/÷]\s*(?:\([^)]+\)|\{[^}]+\}|[A-Za-zА-Яа-я0-9](?:[_^][\d{}()+\-])*|[0-9]+(?:\.\d+)?)"
+    r")",
+    re.UNICODE,
+)
+_MATH_PAREN_RE = re.compile(
+    r"(?:"
+    r"[(\[]\s*[A-Za-zА-Яа-я0-9∫∑∏∂√∞∇±×÷≠≤≥≈∝](?:[_^][\d{}()+\-])*\s*(?:[=<>≤≥≥≠±+*/÷^]\s*[A-Za-zА-Яа-я0-9∫∑∏∂√∞∇±×÷≠≤≥≈∝](?:[_^][\d{}()+\-])*|[0-9]+(?:\.\d+)?)\s*[)\]]"
+    r"|"
+    r"[(\[]\s*[0-9]+(?:\.\d+)?\s*(?:[,;]\s*[0-9]+(?:\.\d+)?)\s*[)\]]"
+    r")",
+    re.UNICODE,
+)
+_SPECIAL_MATH_CHARS = set("∫∑∏∂√∞∇αβγδεζηθικλμνξοπρστυφχψωΩ")
 
 
 def _extract_protected_tokens(text: str) -> Tuple[str, Dict[str, str]]:
@@ -140,6 +158,14 @@ def _extract_protected_tokens(text: str) -> Tuple[str, Dict[str, str]]:
     # Защита математических выражений (x = 0.05, p < 0.01, ∫ f(x) dx и т.д.)
     math_spans = []
     for m in _MATH_EXPR_RE.finditer(result):
+        value = m.group(0).strip()
+        if len(value) > 3:
+            math_spans.append((m.start(), m.end(), value))
+    for m in _MATH_EXPR_RE2.finditer(result):
+        value = m.group(0).strip()
+        if len(value) > 3:
+            math_spans.append((m.start(), m.end(), value))
+    for m in _MATH_PAREN_RE.finditer(result):
         value = m.group(0).strip()
         if len(value) > 3:
             math_spans.append((m.start(), m.end(), value))

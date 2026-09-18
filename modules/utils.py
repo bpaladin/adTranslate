@@ -27,7 +27,7 @@ def stage_timer(name: str, timings: Optional[Dict[str, float]] = None):
         yield
     finally:
         elapsed = time.perf_counter() - t0
-        logger.info(f"  {name}: {_format_time(elapsed)}")
+        logger.debug(f"  {name}: {_format_time(elapsed)}")
         if timings is not None:
             timings[name] = elapsed
 

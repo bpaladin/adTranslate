@@ -31,10 +31,24 @@ class Block:
     caption: Optional[str] = None
     table_data: Optional[List[List[str]]] = None
     translation: Optional[str] = None
+    # pdf2html-совместимые поля: hyphen-склеенный текст и метрики шрифта.
+    # text_override хранит repaired-текст отдельно от spans (иначе naive
+    # join вернёт "How- ever" вместо "However").
+    text_override: Optional[str] = None
+    font_size: float = 0.0
+    font_flags: int = 0
+    color: int = 0
+    starts_with_bold: bool = False
 
     @property
     def text(self) -> str:
+        if self.text_override is not None:
+            return self.text_override
         return " ".join(span.text for line in self.lines for span in line.spans).strip()
+
+    @text.setter
+    def text(self, value: str) -> None:
+        self.text_override = value
 
 
 @dataclass
@@ -86,8 +100,14 @@ def block_metrics(block: Block, page_width: float = 0.0) -> BlockMetrics:
                 max_font = span.size
             if span.text and not span.text.isupper():
                 all_upper = False
-            if span.flags & 2**0:
+            if (span.flags & 16) or (span.flags & 2**0) or ("bold" in (span.font or "").lower()):
                 has_bold = True
+    if max_font <= 0:
+        max_font = float(getattr(block, "font_size", 0.0) or 0.0)
+    if not has_bold and getattr(block, "font_flags", 0) & 16:
+        has_bold = True
+    if not has_bold and getattr(block, "starts_with_bold", False):
+        has_bold = True
     bbox = block.bbox
     center_x = (bbox[0] + bbox[2]) / 2
     is_centered = abs(center_x - page_width / 2) < page_width * 0.1 if page_width else False

@@ -34,6 +34,7 @@ p { line-height: 1.7; margin: 0 0 10px; text-align: justify; }
 .figure { margin: 20px 0; text-align: center; }
 .figure img { max-width: 100%; height: auto; border-radius: 6px; cursor: zoom-in; }
 .figure-caption { margin-top: 6px; font-style: italic; color: $CAPTION_COLOR; font-size: 0.85em; }
+.figure-extra { margin-top: 4px; font-size: 0.8em; color: #999; }
 .list-block { margin-left: 20px; line-height: 1.6; }
 .ref-link { color: $REFLINK_COLOR; font-weight: bold; }
 .table-wrap tbody tr:nth-child(even) td { background: $TBODY_EVEN; }
@@ -113,7 +114,73 @@ def render_spans(block):
                 text = f"<i>{text}</i>"
             parts.append(text)
         parts.append("\n")
-    return " ".join(parts)
+    return _repair_render_hyphens(" ".join(parts))
+
+
+_RENDER_PREFIXES = frozenset(
+    "non pre post anti auto co de dis ex extra hyper inter intra macro meta "
+    "micro mid mini multi over pseudo re semi sub super trans ultra under uni "
+    "well high low long short self cross deep fast real un mis counter "
+    "де ре пост пре анти авто со экс гипер интер макро микро мульти сверх суб "
+    "транс ультра высоко низко долго само взаимо полу недо пере".split()
+)
+_RENDER_TAILS = frozenset(
+    "of the a an in on and or to "
+    "в на с к о у об от до по из за над под".split()
+)
+_RENDER_BREAK_RE = re.compile(
+    r"([^\s<>]+)"
+    r"([\-‐‑‒–—―−⁃﹘﹣])"
+    r"((?:</[bi]>)?)"
+    r"\s*\n\s*"
+    r"((?:<[bi]>)?)"
+    r"([^\s<>]+)"
+)
+_WORD_EDGE_RE = re.compile(
+    r"[A-Za-zÀ-ÿА-Яа-яЁё]+(?:['’][A-Za-zА-Яа-яЁё]+)?"
+)
+
+
+def _repair_render_hyphens(s: str) -> str:
+    """Сшивает переносы, видимые в already-escaped span-потоке.
+
+    render_spans склеивает строки через '\\n', поэтому дефис на конце
+    строки + продолжение на следующей чинятся здесь же — иначе raw-HTML
+    показывает «How- ever», хотя block.text уже склеен. Теги <b>/<i>
+    вокруг стыка сохраняются.
+    """
+    def _sub(m: re.Match) -> str:
+        lw_full, hy, ct, ot, rw_full = m.groups()
+        lw_m = list(_WORD_EDGE_RE.finditer(lw_full))
+        rw_m = _WORD_EDGE_RE.search(rw_full)
+        if not lw_m or not rw_m:
+            return f"{lw_full}{hy}{ct} {ot}{rw_full}"
+        lw = lw_m[-1].group(0)
+        rw = rw_m.group(0)
+        lw_pre = lw_full[:lw_m[-1].start()]
+        rw_post = rw_full[rw_m.end():]
+        # Только буква-буква; цифры/пунктуация — настоящий дефис с пробелом
+        if not (lw and rw and lw[-1].isalpha() and rw[0].isalpha()):
+            return f"{lw_full}{hy}{ct} {ot}{rw_full}"
+        # Составное слово (префикс/хвост/обломок/заглавная): дефис держим.
+        # Строчное продолжение клеим без пробела («well-known»),
+        # заглавное — через пробел (новое предложение).
+        if (len(lw) <= 1 or len(rw) <= 1
+                or lw.lower() in _RENDER_PREFIXES
+                or rw.lower() in _RENDER_TAILS
+                or rw[0].isupper()):
+            if rw[0].islower():
+                return f"{lw_pre}{lw}{hy}{ct}{ot}{rw}{rw_post}"
+            return f"{lw_full}{hy}{ct} {ot}{rw_full}"
+        # Перенос: убираем дефис и разрыв строки
+        return f"{lw_pre}{lw}{ct}{ot}{rw}{rw_post}"
+
+    prev = None
+    cur = s
+    while prev != cur:
+        prev = cur
+        cur = _RENDER_BREAK_RE.sub(_sub, cur)
+    return cur
 
 
 def _block_html(block: Block) -> str:
@@ -179,8 +246,8 @@ def _block_html(block: Block) -> str:
         spans_text = render_spans(block)
         anchor = f' id="{e(getattr(block, "_anchor", ""))}"' if getattr(block, "_anchor", None) else ''
         if orig != trans:
-            return f'<div class="trans-head"{anchor}><p class="orig">{orig_html(spans_text)}</p><p class="trans">{trans_html(trans)}</p></div>\n'
-        return f"<p class='trans'><b>{trans_html(trans)}</b></p>\n"
+            return f'<div class="trans-head"{anchor}><p class="orig">{orig_html(spans_text)}</p><h3>{trans_html(trans)}</h3></div>\n'
+        return f'<div class="trans-head"{anchor}><h3>{trans_html(trans)}</h3></div>\n'
     if bt == 'list':
         items = orig.split('\n')
         numbered = bool(re.match(r'^\s*\d+[\.\)]', items[0])) if items and items[0].strip() else False
@@ -367,7 +434,7 @@ def _block_html_raw(block: Block) -> str:
         return '<p class="orig">(Изображение не извлечено)</p>\n'
     if bt == 'heading':
         anchor = f' id="{e(getattr(block, "_anchor", ""))}"' if getattr(block, "_anchor", None) else ''
-        return f'<div class="trans-head"{anchor}><p><b>{spans_html(block)}</b></p></div>\n'
+        return f'<div class="trans-head"{anchor}><h3>{spans_html(block)}</h3></div>\n'
     if bt == 'list':
         items = orig.split('\n')
         numbered = bool(re.match(r'^\s*\d+[\.\)]', items[0])) if items and items[0].strip() else False
