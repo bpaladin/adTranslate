@@ -76,14 +76,7 @@ def load_settings(path: str = "settings.json") -> dict:
 SETTINGS = load_settings()
 BLOCK_TIMEOUT = int(SETTINGS["block_timeout"])
 REQUEST_TIMEOUT = max(120, int(SETTINGS["request_timeout"]))
-API_TIMEOUT = SETTINGS["api_timeout"]
-MODEL_COOLDOWN_SEC = SETTINGS["model_cooldown_sec"]
 LLAMA_MAX_RETRIES = SETTINGS["llama_max_retries"]
 MAX_SECTION_CHARS = int(SETTINGS["max_section_chars"])
 MAX_LLM_CHUNK_CHARS = int(SETTINGS["max_llm_chunk_chars"])
 MIN_LLM_CHUNK_CHARS = int(SETTINGS["min_llm_chunk_chars"])
-
-OPENAI_API_KEY = os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENAI_API_KEY")
-OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://sprutdock.ru/v1")
-DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "z-ai/glm-5.2:free")
-SPRUTDOCK_API_KEY = os.getenv("SPRUTDOCK_API_KEY") or OPENAI_API_KEY

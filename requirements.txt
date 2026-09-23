@@ -1,13 +1,16 @@
 # PDF Translator — зависимости main.py
-# pymupdf_layout (опционально) и httpx (входит в openai) не требуются отдельно
 pymupdf>=1.24.0
 pdfplumber>=0.10.0
-openai>=1.30.0
 requests>=2.31.0
 jinja2>=3.1.0
 tqdm>=4.65.0
 markdown>=3.5.0
 cachetools>=5.3.0
+# Локальный переводчик CTranslate2 (Helsinki-NLP Opus-MT, CPU int8)
+# Токенизатор: transformers + sentencepiece
+ctranslate2>=3.0.0
+transformers>=4.30.0
+sentencepiece>=0.1.99
 # Опционально: точная детекция переносов (словарная проверка RU/EN).
 # Без pyphen и data/words_*.txt алгоритм работает на эвристиках.
 pyphen>=0.14.0

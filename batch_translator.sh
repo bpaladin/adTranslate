@@ -15,4 +15,4 @@ for pdf_file in "$CATALOG"/*.pdf; do
         python ~/venv/adTranslate/main.py -t llama "$pdf_file"
     fi
 done
-rm ./translation_cache.json
+rm -f "$(dirname "$0")/config/translation_cache.json"

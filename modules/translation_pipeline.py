@@ -9,7 +9,7 @@ from .models import Block
 from .translation_utils import validate_translation, _strip_llm_wrappers, _restore_protected, _extract_protected_tokens
 from .translator_llama import LlamaCppTranslator, _is_short_citation
 from .translation_cache import TranslationCache
-from .utils import normalize_text, _interruptible_sleep, _start_keyboard_watchdog, _format_time, STOP_EVENT
+from .utils import normalize_text, _interruptible_sleep, _start_keyboard_watchdog, _format_time, STOP_EVENT, split_by_sentences
 from .citation import _wrap_citation_spans
 from .config import SETTINGS, BLOCK_TIMEOUT, REQUEST_TIMEOUT, MAX_SECTION_CHARS, MAX_LLM_CHUNK_CHARS, MIN_LLM_CHUNK_CHARS
 
@@ -54,7 +54,7 @@ def translate_chunk_with_retry(chunk: str, translator, max_retries: int = 3,
 
 
 def _split_text_by_paragraphs(text: str, max_chars: int = 1800) -> List[str]:
-    # Пункт 3: убираем normalize_text, т.к. текст уже нормализован
+    # Текст уже нормализован. Возвращает [] если делить не на что (сигнал "не сплитить").
     if len(text) <= max_chars:
         return [text]
     paragraphs = re.split(r'\n\s*\n', text)
@@ -68,65 +68,8 @@ def _split_text_by_paragraphs(text: str, max_chars: int = 1800) -> List[str]:
         if len(para) <= max_chars:
             result.append(para)
         else:
-            result.extend(_split_text_for_llm(para, max_chars, max(80, max_chars // 3)))
+            result.extend(split_by_sentences(para, max_chars, max(80, max_chars // 3)))
     return result if len(result) > 1 else []
-
-
-def _split_text_for_llm(text: str, max_chars: int = 1800, min_chunk_chars: int = 650) -> List[str]:
-    # Пункт 3: убираем normalize_text, используем предкомпилированную регулярку из класса
-    if len(text) <= max_chars:
-        return [text]
-    # используем self._protected_abbr, но здесь нет self; сделаем глобальную или передадим
-    # Для простоты оставим локальную, но можно передать из класса.
-    protected_abbr = re.compile(r"\b(?:e\.g|i\.e|et al|fig|figs|eq|eqs|dr|mr|mrs|ms|prof|no|nos|vs|approx|ca|p|pp)\.$", re.I)
-    parts = []
-    start = 0
-    for m in re.finditer(r"[.!?](?:[\"'""'\)\]]*)\s+(?=[A-ZА-ЯЁ0-9])", text):
-        left = text[start:m.end()].strip()
-        if not left:
-            continue
-        if protected_abbr.search(left[-12:]):
-            continue
-        parts.append(left)
-        start = m.end()
-    tail = text[start:].strip()
-    if tail:
-        parts.append(tail)
-
-    if len(parts) <= 1:
-        words = text.split()
-        chunks, cur = [], []
-        cur_len = 0
-        for word in words:
-            add_len = len(word) + (1 if cur else 0)
-            if cur and cur_len + add_len > max_chars:
-                chunks.append(" ".join(cur))
-                cur, cur_len = [word], len(word)
-            else:
-                cur.append(word)
-                cur_len += add_len
-        if cur:
-            chunks.append(" ".join(cur))
-        return chunks
-
-    chunks, cur, cur_len = [], [], 0
-    for part in parts:
-        plen = len(part)
-        if cur and cur_len + plen + 1 > max_chars:
-            chunks.append(" ".join(cur))
-            cur, cur_len = [], 0
-        cur.append(part)
-        cur_len += plen + (1 if cur_len else 0)
-    if cur:
-        chunks.append(" ".join(cur))
-
-    merged = []
-    for ch in chunks:
-        if merged and len(ch) < min_chunk_chars and len(merged[-1]) + len(ch) + 1 <= max_chars:
-            merged[-1] += " " + ch
-        else:
-            merged.append(ch)
-    return merged
 
 
 class TranslationPipeline:
@@ -148,9 +91,6 @@ class TranslationPipeline:
         self._switched_to_fallback = False
         self._original_translator = None
 
-        # Пункт 3: предкомпилированная регулярка для аббревиатур
-        self._protected_abbr = re.compile(r"\b(?:e\.g|i\.e|et al|fig|figs|eq|eqs|dr|mr|mrs|ms|prof|no|nos|vs|approx|ca|p|pp)\.$", re.I)
-
         # Пункт 7: in-memory кэш для быстрого доступа
         self._mem_cache = {}  # key: (text, lang) -> translation
         self._mem_cache_limit = 1000
@@ -168,9 +108,24 @@ class TranslationPipeline:
     def _safe_cache_get(cache, text, lang):
         value = cache.get(text, lang)
         if value and value.strip():
-            ok, _ = validate_translation(text, value, lang)  # пока оставим, но можно убрать
+            ok, _ = validate_translation(text, value, lang)
             return value if ok else None
         return None
+
+    def _validate(self, source: str, candidate: str, lang: str,
+                  protected: Optional[Dict[str, str]] = None) -> Optional[str]:
+        """Полная проверка validate_translation (эхо, длина, мета-ответ).
+
+        Возвращает candidate при успехе, иначе None + счётчик rejected.
+        """
+        if not candidate:
+            return None
+        ok, _ = validate_translation(source, candidate, lang, protected)
+        if not ok:
+            with self._stats_lock:
+                self.stats["rejected"] += 1
+            return None
+        return candidate
 
     def _translate_one(self, text: str, lang: str, glossary: Optional[Dict[str, str]] = None,
                        context_before: str = "", context_after: str = "",
@@ -188,7 +143,7 @@ class TranslationPipeline:
 
         if _allow_split and len(text) > MAX_LLM_CHUNK_CHARS:
             para_chunks = _split_text_by_paragraphs(text, MAX_LLM_CHUNK_CHARS)
-            chunks = para_chunks if para_chunks else _split_text_for_llm(text, MAX_LLM_CHUNK_CHARS, MIN_LLM_CHUNK_CHARS)
+            chunks = para_chunks if para_chunks else split_by_sentences(text, MAX_LLM_CHUNK_CHARS, MIN_LLM_CHUNK_CHARS)
             if len(chunks) > 1:
                 out = []
                 for i, chunk in enumerate(chunks):
@@ -243,16 +198,11 @@ class TranslationPipeline:
         )
 
         if result:
-            result = _strip_llm_wrappers(_restore_protected(result, tokens)).strip()
-            # Пункт 4: упрощаем валидацию – только проверяем не пусто и длина не слишком мала
-            if result and len(result) > 2:
-                valid = True
-            else:
-                valid = False
-            if not valid:
-                result = None
-                with self._stats_lock:
-                    self.stats["rejected"] += 1
+            result = self._validate(
+                text,
+                _strip_llm_wrappers(_restore_protected(result, tokens)).strip(),
+                lang, tokens,
+            )
 
         if not result and self.fallback and time.monotonic() < deadline:
             result = translate_chunk_with_retry(
@@ -260,13 +210,11 @@ class TranslationPipeline:
                 self.fallback, max_retries=2, glossary=glossary, deadline=deadline,
             )
             if result:
-                result = _strip_llm_wrappers(_restore_protected(result, tokens)).strip()
-                if result and len(result) > 2:
-                    valid = True
-                else:
-                    valid = False
-                if not valid:
-                    result = None
+                result = self._validate(
+                    text,
+                    _strip_llm_wrappers(_restore_protected(result, tokens)).strip(),
+                    lang, tokens,
+                )
 
         if result:
             self.cache.put(text, lang, result)
@@ -301,7 +249,7 @@ class TranslationPipeline:
         size = 600  # единственный размер
         if len(text) <= size:
             return None
-        chunks = _split_text_for_llm(text, size, max(80, min(MIN_LLM_CHUNK_CHARS, size // 3)))
+        chunks = split_by_sentences(text, size, max(80, min(MIN_LLM_CHUNK_CHARS, size // 3)))
         if len(chunks) <= 1:
             return None
         out = []
@@ -523,12 +471,12 @@ class TranslationPipeline:
                     glossary=glossary, deadline=time.monotonic() + self.block_timeout,
                 )
                 if result:
-                    result = _strip_llm_wrappers(result).strip()
-                    if result and len(result) > 2:
-                        valid = True
-                    else:
-                        valid = False
-                    if valid:
+                    result = self._validate(
+                        block.normalized_text,
+                        _strip_llm_wrappers(result).strip(),
+                        lang,
+                    )
+                    if result:
                         block.translation = result
                         self.cache.put(block.normalized_text, lang, result)
                         self._mem_cache[(block.normalized_text, lang)] = result

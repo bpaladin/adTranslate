@@ -135,36 +135,45 @@ def _pick_wordlist(left: str, right: str) -> Set[str]:
     return _WORDS_RU | _WORDS_EN
 
 
-def _pick_pyphen(left: str, right: str):
-    sample = left + right
-    cyr = sum(1 for c in sample if "а" <= c.lower() <= "я" or c.lower() == "ё")
-    lat = sum(1 for c in sample if "a" <= c.lower() <= "z")
-    if cyr >= lat and "ru" in _PYPHEN:
-        return _PYPHEN["ru"]
-    if "en" in _PYPHEN:
-        return _PYPHEN["en"]
-    return None
-
-
 def _is_valid_hyphenation_pyphen(left: str, right: str) -> Optional[bool]:
-    dic = _pick_pyphen(left, right)
-    if dic is None:
-        return None
+    """True → разрыв left|right валиден как слоговая граница.
+    False → pyphen(ы) уверенно говорят, что это не слоговая граница
+            (значит, дефис настоящий — compound).
+    None  → нет данных.
+    """
     joined = (left + right).lower()
     if not joined.isalpha():
         return None
-    try:
-        inserted = dic.inserted(joined)
-    except Exception:
-        return None
-    positions = set()
-    offset = 0
-    for ch in inserted:
-        if ch == "-":
-            positions.add(offset)
-        else:
-            offset += 1
-    return len(left) in positions
+
+    cyr = sum(1 for c in joined if "а" <= c <= "я" or c == "ё")
+    lat = sum(1 for c in joined if "a" <= c <= "z")
+    if cyr > lat:
+        langs = ["ru"]
+    elif lat > cyr:
+        langs = ["en"]
+    else:
+        langs = ["ru", "en"]
+
+    saw_verdict = False
+    for lang in langs:
+        dic = _PYPHEN.get(lang)
+        if dic is None:
+            continue
+        try:
+            inserted = dic.inserted(joined)
+        except Exception:
+            continue
+        positions = set()
+        offset = 0
+        for ch in inserted:
+            if ch == "-":
+                positions.add(offset)
+            else:
+                offset += 1
+        if len(left) in positions:
+            return True              # любой язык подтвердил — этого достаточно
+        saw_verdict = True
+    return False if saw_verdict else None
 
 
 def _last_word(s: str) -> str:
@@ -178,7 +187,20 @@ def _first_word(s: str) -> str:
 
 
 def _looks_like_real_hyphen(prefix: str, next_line: str) -> bool:
-    """True → keep hyphen (real compound word); False → join (line break)."""
+    """True → оставить дефис (реальный compound); False → склеить (перенос строки).
+
+    Порядок проверок (сильные сигналы раньше слабых):
+      1. Пробел перед дефисом → это тире, оставить.
+      2. Цифры / пунктуация на границе → дефис настоящий.
+      3. Аббревиатуры-шаблоны (DE, P12, …) → оставить.
+      4. Словарь: left+right — слово → перенос (склеить).
+      5. Словарь: left и right оба — слова → compound (оставить).
+      6. Префиксы compound (well-, pre-, недо-) → оставить.
+      7. Функциональные хвосты (of, в, на, …) → оставить.
+      8. pyphen(ы) → авторитетный вердикт.
+      9. Заглавная в правой части → оставить (имя собственное).
+     10. По умолчанию → склеить.
+    """
     if not prefix or not next_line:
         return True
     left, hyphen = _split_trailing_hyphen(prefix)
@@ -187,42 +209,67 @@ def _looks_like_real_hyphen(prefix: str, next_line: str) -> bool:
     right = next_line.lstrip()
     if not right:
         return True
+
     raw = prefix.rstrip()
+    # 1. Пробел перед дефисом → тире.
     if len(raw) >= 2 and raw[-1] in _HYPHEN_CHARS and raw[-2].isspace():
         return True
+
+    # 2. Цифры на границе.
     if left and (left[-1].isdigit() or right[0].isdigit()):
         return True
+
+    # Пунктуация после дефиса.
     if right[0] in ")]}»\"'.,;:!?-–—•·":
         return True
+
+    # Не-буквенная граница.
     if not (left and left[-1].isalpha() and right[0].isalpha()):
         return True
+
+    # 3. Аббревиатуры/обозначения.
     if re.search(r"\b(?:DE|IE|NE|SD|SE|EEG|EOG|EMG|ECG|P\d+|N\d+)$", left, re.I):
         return True
+
     lw = _last_word(left) or left
     rw = _first_word(right) or right
+
     if len(lw) <= 1 or len(rw) <= 1:
         return True
+
+    # 4-5. Словарь — самый надёжный сигнал, идёт ДО эвристик.
     words = _pick_wordlist(lw, rw)
     if words:
-        joined_is_word = (lw + rw).lower() in words
+        joined = (lw + rw).lower()
+        joined_is_word = joined in words
         left_is_word = lw.lower() in words
         right_is_word = rw.lower() in words
         if joined_is_word:
-            return False
+            return False                       # перенос
         if left_is_word and right_is_word:
-            return True
+            return True                        # настоящий compound
+
+    # 6. Известные compound-префиксы.
     if _COMPOUND_PREFIXES.match(lw):
         return True
+
+    # 7. Функциональный хвост.
     if rw.lower() in _FUNCTION_TAIL_WORDS:
         return True
-    try:
-        pyphen_verdict = _is_valid_hyphenation_pyphen(lw, rw)
-    except Exception:
-        pyphen_verdict = None
-    if pyphen_verdict is True and rw[0].islower():
-        return False
+
+    # 8. pyphen — авторитетный вердикт.
+    pyphen_verdict = _is_valid_hyphenation_pyphen(lw, rw)
+    if pyphen_verdict is True:
+        return False                           # слоговая граница → склеить
+    if pyphen_verdict is False:
+        # Не слоговая граница → это настоящий дефис (well-known, e-mail …).
+        return True
+
+    # 9. Заглавная в правой части → вероятно имя собственное.
     if rw[0].isupper():
         return True
+
+    # 10. Default: склеить.
     return False
 
 
@@ -572,7 +619,10 @@ def _try_merge_hyphen_pair(a: Block, b: Block) -> Optional[Block]:
         return None
     if bool(_RE_FIG_MARKER.match(bt)) or bool(_RE_TBL_MARKER.match(bt)):
         return None
-    if _looks_like_real_hyphen(base[-80:], bt[:80]):
+    # Передаём в детектор только последнее/первое СЛОВО, не срезы символов.
+    lw = _last_word(base) or base
+    rw = _first_word(bt) or bt
+    if _looks_like_real_hyphen(lw + "-", rw):
         return None
     try:
         ax0, ay0, ax1, ay1 = tuple(a.bbox)
@@ -590,7 +640,8 @@ def _try_merge_hyphen_pair(a: Block, b: Block) -> Optional[Block]:
     elif not (-2.0 <= gap <= 2.5 * line_h):
         return None
     try:
-        if abs(float(getattr(a, "font_size", 0) or 0) - float(getattr(b, "font_size", 0) or 0)) > 1.5:
+        if abs(float(getattr(a, "font_size", 0) or 0)
+               - float(getattr(b, "font_size", 0) or 0)) > 1.5:
             return None
     except Exception:
         pass

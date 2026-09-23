@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 def generate_summary(pages: list, summary_translator_type: str, translate_translator_type: str,
                      lang: str, llama_url: str = "http://localhost:8080/v1",
                      llama_model: Optional[str] = None, auto_find: bool = True,
-                     sprut_model: Optional[str] = None, quiet: bool = False) -> Dict[str, Any]:
+                     transformers_model: Optional[str] = None, quiet: bool = False) -> Dict[str, Any]:
     all_text = []
     for page in pages:
         for block in page.blocks:
@@ -27,19 +27,21 @@ def generate_summary(pages: list, summary_translator_type: str, translate_transl
         return {"summary_html": "<p>Не удалось извлечь текст для реферата.</p>",
                 "stats": {"chunks": 0, "tokens": 0, "speed": 0}}
 
-    if summary_translator_type == "google":
+    if summary_translator_type in ("google", "transformers"):
         summary_translator_type = "llama"
 
     try:
         summary_translator, _ = create_translator(summary_translator_type, "en", llama_url=llama_url,
-                                                   llama_model=llama_model, auto_find=auto_find, sprut_model=sprut_model)
+                                                   llama_model=llama_model, auto_find=auto_find,
+                                                   transformers_model=transformers_model)
     except Exception as e:
         return {"summary_html": f"<p>Ошибка LLM: {e}</p>",
                 "stats": {"chunks": 0, "tokens": 0, "speed": 0, "error": str(e)}}
 
     try:
         final_translator, _ = create_translator(translate_translator_type, lang, llama_url=llama_url,
-                                                 llama_model=llama_model, auto_find=auto_find, sprut_model=sprut_model)
+                                                 llama_model=llama_model, auto_find=auto_find,
+                                                 transformers_model=transformers_model)
     except Exception as e:
         return {"summary_html": f"<p>Ошибка переводчика: {e}</p>",
                 "stats": {"chunks": 0, "tokens": 0, "speed": 0, "error": str(e)}}

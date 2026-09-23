@@ -23,7 +23,6 @@ from .utils import stage_timer, _format_time
 from .logging_setup import logger
 from .models import Page
 from .config import BLOCK_TIMEOUT
-from .pdf_extraction import PDFExtractor
 from .table_detection import extract_tables, _find_span_table_blocks, consolidate_tables
 from .figure_extraction import extract_images, extract_vector_figures, bake_composite_figures
 from .classifier import _classifier
@@ -210,21 +209,24 @@ def _run_extraction(pdf_path: str, debug_text: bool = False):
     Callers must close doc/pdf (done here on success path via returned
     handles — actually closed inside; kept open only during processing).
     """
-    extractor = PDFExtractor(pdf_path)
-    pages = extractor.extract()
     doc = fitz.open(pdf_path)
     pdf = pdfplumber.open(pdf_path)
     total_images = 0
     total_tables = 0
+    pages = [
+        Page(num=i + 1, blocks=[],
+             width=doc[i].rect.width, height=doc[i].rect.height)
+        for i in range(len(doc))
+    ]
 
     for page in pages:
         fitz_page = doc[page.num - 1]
-        # 1. Single text source (pdf2html): ignore cropped extractor blocks,
-        #    re-extract full-page dict blocks.
+        # 1. Single text source (pdf2html): full-page dict blocks via
+        #    text_extraction (старый PDFExtractor давал только text-блоки,
+        #    которые всё равно отбрасывались, — удалён).
         text_blocks = extract_text_blocks(fitz_page, page.num)
         # Cross-block hyphen merges while blocks are still line-accurate.
         text_blocks = merge_hyphen_split_blocks(text_blocks)
-        non_text = [b for b in page.blocks if b.type != "text"]
 
         # 2. pdfplumber tables
         plumber_tables = []
@@ -327,7 +329,7 @@ def _run_extraction(pdf_path: str, debug_text: bool = False):
         text_blocks = remove_figure_overlapping_text(text_blocks, figure_rects,
                                                      margin_x=2, margin_y=2)
 
-        page.blocks = non_text + text_blocks + table_blocks + figure_blocks
+        page.blocks = text_blocks + table_blocks + figure_blocks
 
     return pages, doc, pdf, total_images, total_tables
 
@@ -404,7 +406,7 @@ def process_pdf(
     summary_translator_type: str = "llama",
     translate_translator_type: str = "google",
     dark_html: bool = True,
-    sprut_model: Optional[str] = None,
+    transformers_model: Optional[str] = None,
     debug_text: bool = False,
 ) -> Dict[str, Any]:
 
@@ -440,7 +442,7 @@ def process_pdf(
                 pages, summary_translator_type=summary_translator_type,
                 translate_translator_type=translate_translator_type, lang=lang,
                 llama_url=llama_url, llama_model=llama_model, auto_find=auto_find,
-                sprut_model=sprut_model, quiet=quiet)
+                transformers_model=transformers_model, quiet=quiet)
             summary_html = result["summary_html"]
             gen_stats = result["stats"]
 
@@ -458,19 +460,19 @@ def process_pdf(
         try:
             translator, fallback = create_translator(
                 translator_type, lang, llama_url=llama_url, llama_model=llama_model,
-                auto_find=auto_find, sprut_model=sprut_model)
+                auto_find=auto_find, transformers_model=transformers_model)
         except RuntimeError as e:
             logger.error(f"   Не удалось инициализировать переводчик '{translator_type}': {e}")
             return {"stats": {"error": str(e)}, "pages": 0, "images": 0, "tables": 0}
 
-        effective_workers = 1 if translator_type == "llama" else max_workers
-        if translator_type == "llama" and not quiet:
-            logger.info("   Локальный сервер: ограничено до 1 воркера (параллельные запросы вызывают зацикливание/галлюцинации)")
+        effective_workers = 1 if translator_type in ("llama", "transformers") else max_workers
+        if translator_type in ("llama", "transformers") and not quiet:
+            logger.info("   Локальный переводчик: ограничено до 1 воркера (модель не потокобезопасна для параллельных запросов)")
 
         pipeline = TranslationPipeline(
             translator=translator, fallback=fallback,
             max_workers=effective_workers, timeout=timeout,
-            is_local=(translator_type == "llama"), translator_type=translator_type,
+            is_local=(translator_type in ("llama", "transformers")), translator_type=translator_type,
         )
 
         all_blocks = [block for page in pages for block in page.blocks]

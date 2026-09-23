@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 PDF Translator — единый скрипт для перевода и реферирования PDF-документов.
-Поддерживает Google Translate, OpenRouter/SprutDock и локальный llama.cpp.
+Поддерживает Google Translate, локальный CTranslate2 (Helsinki-NLP Opus-MT, CPU int8)
+и локальный llama.cpp.
 """
 
 import os
@@ -71,7 +72,11 @@ def interactive_mode():
 
     if action == "1":
         lang = input("Целевой язык [ru]: ").strip() or "ru"
-        translator = input("Переводчик (google/llama/openrouter/sprut) [google]: ").strip() or "google"
+        while True:
+            translator = input("Переводчик (google/llama/transformers) [google]: ").strip() or "google"
+            if translator in ("google", "llama", "transformers"):
+                break
+            print("  Введите google, llama или transformers")
         output_html = f"{input_base}_translate.html"
         print(f"\nЗапуск перевода -> {output_html}\n")
         result = process_pdf(
@@ -109,18 +114,18 @@ def main():
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("input", help="Входной PDF файл")
     parser.add_argument("-l", "--lang", default="ru", help="Целевой язык (по умолчанию: ru)")
-    parser.add_argument("-t", "--translator", default="google", choices=["google", "llama", "openrouter", "sprut"],
+    parser.add_argument("-t", "--translator", default="google", choices=["google", "llama", "transformers"],
                         help="Переводчик (по умолчанию: google)")
     parser.add_argument("--llama-url", default="http://localhost:8080/v1", help="URL llama.cpp сервера")
     parser.add_argument("--llama-model", help="Ожидаемое имя модели")
-    parser.add_argument("--sprut-model", default=os.getenv("SPRUT_MODEL"),
-                        help="Модель для SprutDock (например, z-ai/glm-5.2:free)")
+    parser.add_argument("--transformers-model", default=os.getenv("TRANSFORMERS_MODEL"),
+                        help="HF-модель для CTranslate2 или готовый каталог CT2 (по умолчанию: авто по языку, например Helsinki-NLP/opus-mt-en-ru)")
     parser.add_argument("--no-auto-find", action="store_true", help="Отключить автоматический поиск сервера")
     parser.add_argument("--summary", action="store_true", help="Режим реферата")
     parser.add_argument("--raw-html", action="store_true", help="Сохранение в HTML без перевода")
-    parser.add_argument("--summary-translator", choices=["google", "llama", "openrouter", "sprut"],
+    parser.add_argument("--summary-translator", choices=["llama"],
                         default="llama", help="Генератор реферата (по умолчанию: llama)")
-    parser.add_argument("--summary-lang-translator", choices=["google", "llama", "openrouter", "sprut"],
+    parser.add_argument("--summary-lang-translator", choices=["google", "llama", "transformers"],
                         default="google", help="Переводчик реферата (по умолчанию: google)")
     parser.add_argument("--workers", type=int, default=min(8, (os.cpu_count() or 1) * 2), help="Число воркеров")
     parser.add_argument("--block-timeout", type=int, default=BLOCK_TIMEOUT, help="Максимум секунд на один блок")
@@ -168,7 +173,7 @@ def main():
                 llama_url=args.llama_url, llama_model=args.llama_model, auto_find=not args.no_auto_find,
                 max_workers=args.workers, timeout=args.block_timeout, quiet=args.quiet, summary_mode=args.summary,
                 summary_translator_type=args.summary_translator, translate_translator_type=args.summary_lang_translator,
-                dark_html=dark_html, sprut_model=args.sprut_model,
+                dark_html=dark_html, transformers_model=args.transformers_model,
                 debug_text=args.debug_text,
             )
 

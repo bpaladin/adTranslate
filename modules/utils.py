@@ -9,7 +9,7 @@ from typing import Optional, Dict, List
 
 from .logging_setup import logger
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 STOP_EVENT = threading.Event()
 _watchdog_started = False
@@ -18,6 +18,8 @@ RE_WHITESPACE = re.compile(r'[ \t]+')
 RE_HYPHEN_BREAK = re.compile(r'(\w+)-\s*\n\s*(\w+)')
 
 LIST_LINE_RE = re.compile(r'^[\s]*([•\-\*►▸‣⁃◦○●▪]|\d+[\.\)]\s|[a-z]\.\s)', re.MULTILINE)
+
+_PROTECTED_ABBR = re.compile(r"\b(?:e\.g|i\.e|et al|fig|figs|eq|eqs|dr|mr|mrs|ms|prof|no|nos|vs|approx|ca|p|pp)\.$", re.I)
 
 
 @contextlib.contextmanager
@@ -61,23 +63,69 @@ def _count_list_lines(text: str) -> int:
     return len(LIST_LINE_RE.findall(text))
 
 
-def _chunk_text_by_sentences(text: str, max_chunk_size: int = 6000) -> List[str]:
-    sentences = re.split(r'(?<=[.!?])\s+', text)
-    chunks = []
-    current = []
-    current_len = 0
-    for sent in sentences:
-        sent_len = len(sent)
-        if current_len + sent_len + 1 > max_chunk_size and current:
-            chunks.append(" ".join(current))
-            current = [sent]
-            current_len = sent_len
+def split_by_sentences(text: str, max_chars: int = 1800, min_chunk_chars: int = 650) -> List[str]:
+    """Разбить текст по предложениям на куски ≤ max_chars.
+
+    Единая реализация для translation_pipeline, summary и transformers-бэкенда:
+    защита аббревиатур (e.g., Fig., et al.), fallback по словам при отсутствии
+    границ предложений, склейка коротких хвостов (< min_chunk_chars).
+    При min_chunk_chars=0 склейка отключена (поведение старых наивных сплиттеров).
+    """
+    if len(text) <= max_chars:
+        return [text]
+    parts = []
+    start = 0
+    for m in re.finditer(r'''[.!?](?:[]"'""')]*)\s+(?=[A-ZА-ЯЁ0-9])''', text):
+        left = text[start:m.end()].strip()
+        if not left:
+            continue
+        if _PROTECTED_ABBR.search(left[-12:]):
+            continue
+        parts.append(left)
+        start = m.end()
+    tail = text[start:].strip()
+    if tail:
+        parts.append(tail)
+
+    if len(parts) <= 1:
+        words = text.split()
+        chunks, cur = [], []
+        cur_len = 0
+        for word in words:
+            add_len = len(word) + (1 if cur else 0)
+            if cur and cur_len + add_len > max_chars:
+                chunks.append(" ".join(cur))
+                cur, cur_len = [word], len(word)
+            else:
+                cur.append(word)
+                cur_len += add_len
+        if cur:
+            chunks.append(" ".join(cur))
+        return chunks
+
+    chunks, cur, cur_len = [], [], 0
+    for part in parts:
+        plen = len(part)
+        if cur and cur_len + plen + 1 > max_chars:
+            chunks.append(" ".join(cur))
+            cur, cur_len = [], 0
+        cur.append(part)
+        cur_len += plen + (1 if cur_len else 0)
+    if cur:
+        chunks.append(" ".join(cur))
+
+    merged = []
+    for ch in chunks:
+        if merged and len(ch) < min_chunk_chars and len(merged[-1]) + len(ch) + 1 <= max_chars:
+            merged[-1] += " " + ch
         else:
-            current.append(sent)
-            current_len += sent_len + 1
-    if current:
-        chunks.append(" ".join(current))
-    return chunks if chunks else [text]
+            merged.append(ch)
+    return merged
+
+
+def _chunk_text_by_sentences(text: str, max_chunk_size: int = 6000) -> List[str]:
+    # min_chunk_chars=0: для реферата склейка хвостов не нужна, как раньше.
+    return split_by_sentences(text, max_chunk_size, 0)
 
 
 def _interruptible_sleep(delay: float, step: float = 0.5) -> None:
